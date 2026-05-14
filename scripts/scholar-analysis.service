@@ -1,0 +1,18 @@
+[Unit]
+Description=ScholarAnalysis MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=g203
+Group=g203
+WorkingDirectory=/home/g203/zhanghaonan/ScholarAnalysis
+EnvironmentFile=/home/g203/zhanghaonan/ScholarAnalysis/.env
+ExecStart=/home/g203/zhanghaonan/ScholarAnalysis/venv/bin/python -m scholar_analysis.main
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
