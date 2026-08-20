@@ -42,6 +42,16 @@ class MinerUClient:
             (url.rstrip("/"), user or "", pwd or "") for (url, user, pwd) in endpoints
         ]
         self._timeout = timeout
+        # Long-lived clients for connection reuse (index-aligned with _endpoints).
+        self._clients: list[httpx.AsyncClient | None] = [None] * len(self._endpoints)
+        self._download_client: httpx.AsyncClient | None = None
+
+    async def aclose(self) -> None:
+        for c in self._clients:
+            if c is not None and not c.is_closed:
+                await c.aclose()
+        if self._download_client is not None and not self._download_client.is_closed:
+            await self._download_client.aclose()
 
     @classmethod
     def from_settings(cls, settings: Any = None) -> "MinerUClient":
@@ -66,27 +76,33 @@ class MinerUClient:
             raise ValueError("MinerU endpoint list resolved to empty.")
         return cls(endpoints=triples, timeout=settings.http_timeout)
 
-    def _client_for(
-        self, url: str, username: str, password: str, **kwargs
-    ) -> httpx.AsyncClient:
-        auth: httpx.Auth | None = None
-        if username or password:
-            auth = httpx.BasicAuth(username, password)
-        defaults = dict(
-            base_url=url,
-            auth=auth,
-            timeout=self._timeout,
-            trust_env=False,
-        )
-        defaults.update(kwargs)
-        return httpx.AsyncClient(**defaults)
+    def _client_for(self, idx: int) -> httpx.AsyncClient:
+        """Return the (lazily created) long-lived client for endpoint idx."""
+        c = self._clients[idx]
+        if c is None or c.is_closed:
+            url, user, pwd = self._endpoints[idx]
+            auth: httpx.Auth | None = None
+            if user or pwd:
+                auth = httpx.BasicAuth(user, pwd)
+            c = httpx.AsyncClient(
+                base_url=url,
+                auth=auth,
+                timeout=self._timeout,
+                trust_env=False,
+            )
+            self._clients[idx] = c
+        return c
 
-    def _download_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            timeout=self._timeout,
-            follow_redirects=True,
-            trust_env=False,
-        )
+    def _get_download_client(self) -> httpx.AsyncClient:
+        c = self._download_client
+        if c is None or c.is_closed:
+            c = httpx.AsyncClient(
+                timeout=self._timeout,
+                follow_redirects=True,
+                trust_env=False,
+            )
+            self._download_client = c
+        return c
 
     async def parse_pdf(
         self,
@@ -112,21 +128,21 @@ class MinerUClient:
         for idx, (url, user, _pwd) in enumerate(self._endpoints, start=1):
             label = f"{url} (auth={'yes' if user else 'no'})"
             try:
-                async with self._client_for(url, user, _pwd) as c:
-                    with open(pdf_path, "rb") as f:
-                        r = await c.post(
-                            "/file_parse",
-                            files={"files": (pdf_path.name, f, "application/pdf")},
-                            data={
-                                "backend": "hybrid-auto-engine",
-                                "return_md": "true",
-                                "formula_enable": "true",
-                                "table_enable": "true",
-                                **({"lang_list": lang_list} if lang_list else {}),
-                            },
-                        )
-                    r.raise_for_status()
-                    result = r.json()
+                c = self._client_for(idx - 1)
+                with open(pdf_path, "rb") as f:
+                    r = await c.post(
+                        "/file_parse",
+                        files={"files": (pdf_path.name, f, "application/pdf")},
+                        data={
+                            "backend": "hybrid-auto-engine",
+                            "return_md": "true",
+                            "formula_enable": "true",
+                            "table_enable": "true",
+                            **({"lang_list": lang_list} if lang_list else {}),
+                        },
+                    )
+                r.raise_for_status()
+                result = r.json()
                 logger.info(
                     "[MinerU] endpoint %d/%d succeeded: %s",
                     idx,
@@ -191,10 +207,10 @@ class MinerUClient:
         tmp_path = temp_dir / f"{uuid.uuid4().hex}.pdf"
 
         try:
-            async with self._download_client() as dl:
-                r = await dl.get(url)
-                r.raise_for_status()
-                tmp_path.write_bytes(r.content)
+            dl = self._get_download_client()
+            r = await dl.get(url)
+            r.raise_for_status()
+            tmp_path.write_bytes(r.content)
 
             logger.info(
                 "Downloaded PDF to %s (%d bytes)", tmp_path, tmp_path.stat().st_size

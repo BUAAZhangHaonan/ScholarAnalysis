@@ -123,11 +123,11 @@ def create_mcp_sse_app(settings: Settings | None = None):
                 with contextlib.suppress(asyncio.CancelledError):
                     await cleanup_task
                 logger.info("Temp cleanup task stopped")
-            # Close the shared httpx client used by the PostProcessor (if instantiated).
+            # Close shared resources (httpx clients, model pool) if instantiated.
             orch = _orchestrator
             if orch is not None:
                 with contextlib.suppress(Exception):
-                    await orch._post_processor.aclose()
+                    await orch.aclose()
 
     app = Starlette(routes=[Mount("/", app=inner_app)], lifespan=lifespan)
 

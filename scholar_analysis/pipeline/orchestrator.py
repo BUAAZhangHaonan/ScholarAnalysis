@@ -35,6 +35,18 @@ class Orchestrator:
         self._arxiv_data_dir = Path(self._settings.arxiv_mirror_data_dir)
         self._parse_sem = asyncio.Semaphore(self._settings.max_concurrent_parses)
 
+    async def aclose(self) -> None:
+        """Close shared resources (httpx clients, model pool)."""
+        for closer in (
+            self._arxiv.aclose,
+            self._mineru.aclose,
+            self._post_processor.aclose,
+        ):
+            try:
+                await closer()
+            except Exception:
+                logger.exception("Error closing orchestrator resource %s", closer)
+
     async def get_paper_text(
         self,
         query: str,
