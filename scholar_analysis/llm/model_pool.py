@@ -25,24 +25,43 @@ class ModelPoolEntry:
     semaphore: asyncio.Semaphore
     last_error_time: float = 0.0
     error_count: int = 0
+    disabled: bool = False
 
     @property
     def in_cooldown(self) -> bool:
+        if self.disabled:
+            return True
         cooldown = get_settings().model_pool_cooldown_seconds
         return (time.monotonic() - self.last_error_time) < cooldown
+
+    def disable(self) -> None:
+        """Permanently disable this entry (e.g. auth failure). Never returns to acquire."""
+        self.disabled = True
+        logger.error(
+            "Model %s (%s) PERMANENTLY DISABLED — will not be acquired again",
+            self.model,
+            self.backend,
+        )
 
     def record_error(self) -> None:
         self.error_count += 1
         self.last_error_time = time.monotonic()
         logger.warning(
             "Model %s (%s) error_count=%d, cooldown for %.0fs",
-            self.model, self.backend, self.error_count,
+            self.model,
+            self.backend,
+            self.error_count,
             get_settings().model_pool_cooldown_seconds,
         )
 
     def record_success(self) -> None:
         if self.error_count > 0:
-            logger.info("Model %s (%s) recovered from %d errors", self.model, self.backend, self.error_count)
+            logger.info(
+                "Model %s (%s) recovered from %d errors",
+                self.model,
+                self.backend,
+                self.error_count,
+            )
         self.error_count = 0
 
 
@@ -99,7 +118,9 @@ class ModelPool:
                     continue
             await asyncio.sleep(0.1)
 
-        cooldown_models = [f"{e.model}(errors={e.error_count})" for e in self._entries if e.in_cooldown]
+        cooldown_models = [
+            f"{e.model}(errors={e.error_count})" for e in self._entries if e.in_cooldown
+        ]
         busy_models = [f"{e.model}" for e in self._entries if not e.in_cooldown]
         raise RuntimeError(
             f"ModelPool: no model available within {timeout}s timeout. "
@@ -113,6 +134,10 @@ class ModelPool:
             entry.record_error()
         entry.semaphore.release()
 
+    def disable(self, entry: ModelPoolEntry) -> None:
+        """Permanently remove an entry from rotation (auth-dead API keys)."""
+        entry.disable()
+
     @property
     def entries(self) -> list[ModelPoolEntry]:
         return list(self._entries)
@@ -123,27 +148,31 @@ class ModelPool:
 
         # Primary: DeepSeek V4 Flash (thinking mode, 256K context)
         if settings.deepseek_api_key.strip():
-            entries.append(ModelPoolEntry(
-                backend="deepseek",
-                model=settings.deepseek_model,
-                api_key=settings.deepseek_api_key,
-                base_url=settings.deepseek_base_url,
-                max_concurrent=settings.deepseek_max_concurrent,
-                context_tokens=settings.deepseek_context_tokens,
-                semaphore=asyncio.Semaphore(settings.deepseek_max_concurrent),
-            ))
+            entries.append(
+                ModelPoolEntry(
+                    backend="deepseek",
+                    model=settings.deepseek_model,
+                    api_key=settings.deepseek_api_key,
+                    base_url=settings.deepseek_base_url,
+                    max_concurrent=settings.deepseek_max_concurrent,
+                    context_tokens=settings.deepseek_context_tokens,
+                    semaphore=asyncio.Semaphore(settings.deepseek_max_concurrent),
+                )
+            )
 
         # Fallback: GLM
         if settings.bigmodel_api_key.strip():
-            entries.append(ModelPoolEntry(
-                backend="glm",
-                model=settings.bigmodel_model,
-                api_key=settings.bigmodel_api_key,
-                base_url=settings.bigmodel_base_url,
-                max_concurrent=settings.bigmodel_max_concurrent,
-                context_tokens=128_000,
-                semaphore=asyncio.Semaphore(settings.bigmodel_max_concurrent),
-            ))
+            entries.append(
+                ModelPoolEntry(
+                    backend="glm",
+                    model=settings.bigmodel_model,
+                    api_key=settings.bigmodel_api_key,
+                    base_url=settings.bigmodel_base_url,
+                    max_concurrent=settings.bigmodel_max_concurrent,
+                    context_tokens=128_000,
+                    semaphore=asyncio.Semaphore(settings.bigmodel_max_concurrent),
+                )
+            )
 
         # Fallback: Qwen (local vLLM) — gate on base_url; api_key may be empty for open access
         if settings.qwen_base_url.strip():
@@ -152,15 +181,17 @@ class ModelPool:
                 settings.qwen_base_url,
                 "set" if settings.qwen_api_key.strip() else "empty (open access)",
             )
-            entries.append(ModelPoolEntry(
-                backend="qwen",
-                model=settings.qwen_model,
-                api_key=settings.qwen_api_key,
-                base_url=settings.qwen_base_url,
-                max_concurrent=settings.qwen_max_concurrent,
-                context_tokens=32_768,
-                semaphore=asyncio.Semaphore(settings.qwen_max_concurrent),
-            ))
+            entries.append(
+                ModelPoolEntry(
+                    backend="qwen",
+                    model=settings.qwen_model,
+                    api_key=settings.qwen_api_key,
+                    base_url=settings.qwen_base_url,
+                    max_concurrent=settings.qwen_max_concurrent,
+                    context_tokens=32_768,
+                    semaphore=asyncio.Semaphore(settings.qwen_max_concurrent),
+                )
+            )
 
         if not entries:
             logger.error(
@@ -171,6 +202,9 @@ class ModelPool:
             logger.info(
                 "ModelPool initialised with %d models: %s",
                 len(entries),
-                ", ".join(f"{e.model}({e.max_concurrent}, ctx={e.context_tokens})" for e in entries),
+                ", ".join(
+                    f"{e.model}({e.max_concurrent}, ctx={e.context_tokens})"
+                    for e in entries
+                ),
             )
         return ModelPool(entries)
