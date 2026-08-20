@@ -1,4 +1,8 @@
-"""Client for the MinerU PDF-to-Markdown API."""
+"""Client for the MinerU PDF-to-Markdown API.
+
+Supports multiple endpoints with priority-ordered fallback. Each endpoint can
+have its own BasicAuth credentials (or none).
+"""
 
 from __future__ import annotations
 
@@ -12,24 +16,64 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class MinerUError(RuntimeError):
+    """Raised when all MinerU endpoints fail."""
+
+
 class MinerUClient:
-    """Async client for MinerU file_parse endpoint."""
+    """Async client for MinerU file_parse endpoint with multi-endpoint fallback."""
 
     def __init__(
         self,
-        base_url: str,
-        username: str,
-        password: str,
+        endpoints: list[tuple[str, str, str]] | None = None,
         timeout: float = 600.0,
-    ):
-        self._base_url = base_url
-        self._auth = httpx.BasicAuth(username, password)
+    ) -> None:
+        """endpoints is a list of (url, username, password) tuples in priority order.
+
+        For an endpoint that does not require auth, pass ("", "") as credentials.
+        """
+        if not endpoints:
+            raise ValueError(
+                "MinerUClient requires at least one endpoint. "
+                "Configure SCHOLAR_ANALYSIS_MINERU_ENDPOINTS or SCHOLAR_ANALYSIS_MINERU_BASE_URL."
+            )
+        self._endpoints: list[tuple[str, str, str]] = [
+            (url.rstrip("/"), user or "", pwd or "") for (url, user, pwd) in endpoints
+        ]
         self._timeout = timeout
 
-    def _mineru_client(self, **kwargs) -> httpx.AsyncClient:
+    @classmethod
+    def from_settings(cls, settings: Any = None) -> "MinerUClient":
+        if settings is None:
+            from scholar_analysis.config import get_settings
+
+            settings = get_settings()
+
+        if not settings.mineru_endpoints_list:
+            raise ValueError(
+                "No MinerU endpoints configured. Set SCHOLAR_ANALYSIS_MINERU_ENDPOINTS "
+                "(comma-separated URLs) or SCHOLAR_ANALYSIS_MINERU_BASE_URL (legacy single URL)."
+            )
+
+        triples: list[tuple[str, str, str]] = []
+        for url, (user, pwd) in zip(
+            settings.mineru_endpoints_list, settings.mineru_creds_list, strict=False
+        ):
+            triples.append((url, user, pwd))
+
+        if not triples:
+            raise ValueError("MinerU endpoint list resolved to empty.")
+        return cls(endpoints=triples, timeout=settings.http_timeout)
+
+    def _client_for(
+        self, url: str, username: str, password: str, **kwargs
+    ) -> httpx.AsyncClient:
+        auth: httpx.Auth | None = None
+        if username or password:
+            auth = httpx.BasicAuth(username, password)
         defaults = dict(
-            base_url=self._base_url,
-            auth=self._auth,
+            base_url=url,
+            auth=auth,
             timeout=self._timeout,
             trust_env=False,
         )
@@ -50,7 +94,7 @@ class MinerUClient:
         text_only: bool = True,
         lang_list: str = "",
     ) -> dict[str, Any]:
-        """Upload a local PDF to MinerU and return the parsed result.
+        """Upload a local PDF to MinerU, trying endpoints in order until one succeeds.
 
         Args:
             pdf_path: Path to the local PDF file.
@@ -59,24 +103,76 @@ class MinerUClient:
 
         Returns:
             MinerU JSON result dict.
-        """
-        async with self._mineru_client() as c:
-            with open(pdf_path, "rb") as f:
-                r = await c.post(
-                    "/file_parse",
-                    files={"files": (pdf_path.name, f, "application/pdf")},
-                    data={
-                        "backend": "hybrid-auto-engine",
-                        "return_md": "true",
-                        "formula_enable": "true",
-                        "table_enable": "true",
-                        **({"lang_list": lang_list} if lang_list else {}),
-                    },
-                )
-            r.raise_for_status()
-            result = r.json()
 
-        return result
+        Raises:
+            MinerUError: If every endpoint failed.
+        """
+        last_exc: Exception | None = None
+        for idx, (url, user, _pwd) in enumerate(self._endpoints, start=1):
+            label = f"{url} (auth={'yes' if user else 'no'})"
+            try:
+                async with self._client_for(url, user, _pwd) as c:
+                    with open(pdf_path, "rb") as f:
+                        r = await c.post(
+                            "/file_parse",
+                            files={"files": (pdf_path.name, f, "application/pdf")},
+                            data={
+                                "backend": "hybrid-auto-engine",
+                                "return_md": "true",
+                                "formula_enable": "true",
+                                "table_enable": "true",
+                                **({"lang_list": lang_list} if lang_list else {}),
+                            },
+                        )
+                    r.raise_for_status()
+                    result = r.json()
+                logger.info(
+                    "[MinerU] endpoint %d/%d succeeded: %s",
+                    idx,
+                    len(self._endpoints),
+                    label,
+                )
+                return result
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code if exc.response is not None else 0
+                last_exc = exc
+                if 400 <= status < 500 and status not in (401, 403, 429):
+                    # Deterministic client-side failure (e.g. 413 payload too large):
+                    # every endpoint would reject the same PDF — don't re-parse.
+                    raise MinerUError(
+                        f"MinerU endpoint {label} returned deterministic HTTP {status}; "
+                        f"not trying remaining endpoints"
+                    ) from exc
+                logger.warning(
+                    "[MinerU] endpoint %d/%d %s returned HTTP %d; trying next",
+                    idx,
+                    len(self._endpoints),
+                    label,
+                    status,
+                )
+            except ValueError as exc:
+                # r.json() failing (JSONDecodeError) — endpoint returned non-JSON
+                last_exc = exc
+                logger.warning(
+                    "[MinerU] endpoint %d/%d %s returned non-JSON body: %s; trying next",
+                    idx,
+                    len(self._endpoints),
+                    label,
+                    exc,
+                )
+            except httpx.RequestError as exc:
+                last_exc = exc
+                logger.warning(
+                    "[MinerU] endpoint %d/%d %s connection error: %s; trying next",
+                    idx,
+                    len(self._endpoints),
+                    label,
+                    exc,
+                )
+
+        raise MinerUError(
+            f"All MinerU endpoints failed ({len(self._endpoints)} tried). Last error: {last_exc}"
+        ) from last_exc
 
     async def parse_from_url(
         self,
@@ -99,8 +195,12 @@ class MinerUClient:
                 r.raise_for_status()
                 tmp_path.write_bytes(r.content)
 
-            logger.info("Downloaded PDF to %s (%d bytes)", tmp_path, tmp_path.stat().st_size)
-            return await self.parse_pdf(tmp_path, text_only=text_only, lang_list=lang_list)
+            logger.info(
+                "Downloaded PDF to %s (%d bytes)", tmp_path, tmp_path.stat().st_size
+            )
+            return await self.parse_pdf(
+                tmp_path, text_only=text_only, lang_list=lang_list
+            )
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -123,6 +223,7 @@ def extract_markdown(parse_result: dict[str, Any], *, text_only: bool = True) ->
 
     if text_only:
         import re
+
         # Remove image references: ![alt](path)
         text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
         # Clean up excessive blank lines
