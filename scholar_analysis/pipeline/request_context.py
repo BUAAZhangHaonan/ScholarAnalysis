@@ -76,3 +76,8 @@ class RequestTracker:
     @property
     def active_count(self) -> int:
         return len(self._contexts)
+
+    @property
+    def active_ids(self) -> set[str]:
+        """IDs of requests currently tracked (their temp dirs must not be reaped)."""
+        return set(self._contexts)

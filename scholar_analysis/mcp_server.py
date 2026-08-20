@@ -91,6 +91,12 @@ def create_mcp_sse_app(settings: Settings | None = None):
 
     from scholar_analysis.pipeline.temp_manager import cleanup_loop
 
+    def _active_request_ids():
+        orch = _orchestrator
+        if orch is None:
+            return set()
+        return orch._tracker.active_ids
+
     @asynccontextmanager
     async def lifespan(app):
         cleanup_task = None
@@ -100,6 +106,7 @@ def create_mcp_sse_app(settings: Settings | None = None):
                     s.temp_dir,
                     s.cleanup_interval_seconds,
                     s.request_max_age_seconds,
+                    active_request_ids=_active_request_ids,
                 )
             )
             logger.info(
