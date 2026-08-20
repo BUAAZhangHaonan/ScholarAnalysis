@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _split_csv(value: str) -> list[str]:
+    """Split a comma-separated string into a stripped list (empty items preserved)."""
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",")]
 
 
 class Settings(BaseSettings):
@@ -21,9 +29,18 @@ class Settings(BaseSettings):
     # Backend APIs
     arxiv_mirror_base_url: str = "http://127.0.0.1:8900/api/v1"
     arxiv_mirror_data_dir: str = ""
-    mineru_base_url: str = "http://localhost:8888"
+
+    # MinerU — legacy single-URL fields (kept for backward compatibility)
+    mineru_base_url: str | None = None
     mineru_username: str = ""
     mineru_password: str = ""
+
+    # MinerU — multi-endpoint pool (preferred). Comma-separated lists paired by index.
+    # Endpoints without auth should have empty username/password at the matching index.
+    mineru_endpoints: str = ""
+    mineru_usernames: str = ""
+    mineru_passwords: str = ""
+
     http_timeout: float = 600.0
 
     # Temp files
@@ -40,7 +57,7 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com/v1/chat/completions"
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_max_concurrent: int = 3
-    deepseek_thinking: bool = True
+    deepseek_thinking: bool = False
     deepseek_context_tokens: int = 256000
 
     # GLM (fallback)
@@ -64,6 +81,39 @@ class Settings(BaseSettings):
 
     # Model pool
     model_pool_cooldown_seconds: float = 30.0
+
+    @model_validator(mode="after")
+    def _normalise_mineru_endpoints(self) -> "Settings":
+        """Resolve mineru_endpoints_list / mineru_creds_list.
+
+        Priority:
+          1. mineru_endpoints (comma-separated multi-URL form)
+          2. legacy mineru_base_url (single URL, wrapped as a one-element list)
+
+        For (2), credentials come from mineru_username/mineru_password.
+        """
+        endpoints = _split_csv(self.mineru_endpoints)
+        if endpoints:
+            usernames = _split_csv(self.mineru_usernames)
+            passwords = _split_csv(self.mineru_passwords)
+            creds: list[tuple[str, str]] = []
+            for i, url in enumerate(endpoints):
+                user = usernames[i] if i < len(usernames) else ""
+                pwd = passwords[i] if i < len(passwords) else ""
+                creds.append((user or "", pwd or ""))
+            self.mineru_endpoints_list = list(endpoints)
+            self.mineru_creds_list = creds
+        elif self.mineru_base_url:
+            self.mineru_endpoints_list = [self.mineru_base_url]
+            self.mineru_creds_list = [(self.mineru_username or "", self.mineru_password or "")]
+        else:
+            self.mineru_endpoints_list = []
+            self.mineru_creds_list = []
+        return self
+
+    # Populated by the model_validator above. Declared here for type hints.
+    mineru_endpoints_list: list[str] = []
+    mineru_creds_list: list[tuple[str, str]] = []
 
 
 _settings: Settings | None = None
