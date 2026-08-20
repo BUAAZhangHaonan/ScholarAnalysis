@@ -192,6 +192,11 @@ async def analyze_paper(
     """
     sem = _get_semaphore()
     async with sem:
+        if language not in ("en", "zh"):
+            logger.info(
+                "analyze_paper: invalid language=%r, falling back to 'en'", language
+            )
+            language = "en"
         orch = _get_orchestrator()
         result = await orch.analyze_paper(
             query=query,
