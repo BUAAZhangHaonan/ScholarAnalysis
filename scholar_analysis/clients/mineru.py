@@ -7,6 +7,7 @@ have its own BasicAuth credentials (or none).
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -205,10 +206,19 @@ class MinerUClient:
             tmp_path.unlink(missing_ok=True)
 
 
+_IMAGE_REF_RE = re.compile(r"!\[(?:[^\]]|\][^(])*\]\([^)]+\)")
+
+
 def extract_markdown(parse_result: dict[str, Any], *, text_only: bool = True) -> str:
     """Extract concatenated Markdown text from MinerU parse result."""
     results = parse_result.get("results", {})
     if not isinstance(results, dict):
+        logger.warning(
+            "MinerU parse result has unexpected 'results' type=%s (expected dict); "
+            "top-level keys: %s",
+            type(results).__name__,
+            list(parse_result.keys()),
+        )
         return ""
 
     parts: list[str] = []
@@ -219,13 +229,18 @@ def extract_markdown(parse_result: dict[str, Any], *, text_only: bool = True) ->
         if md:
             parts.append(md)
 
+    if not parts:
+        logger.warning(
+            "MinerU parse result contained no md_content (results keys: %s)",
+            list(results.keys()),
+        )
+        return ""
+
     text = "\n\n".join(parts)
 
     if text_only:
-        import re
-
-        # Remove image references: ![alt](path)
-        text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+        # Remove image references: ![alt](path) — alt text may itself contain ']'
+        text = _IMAGE_REF_RE.sub("", text)
         # Clean up excessive blank lines
         text = re.sub(r"\n{3,}", "\n\n", text)
 
