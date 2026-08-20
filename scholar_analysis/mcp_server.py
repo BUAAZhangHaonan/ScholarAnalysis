@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import uuid
 from functools import wraps
 
 from scholar_analysis.config import Settings, get_settings
@@ -13,6 +15,7 @@ from scholar_analysis.security import AccessTokenMiddleware
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.routing import Mount
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,7 @@ def _get_orchestrator():
     global _orchestrator
     if _orchestrator is None:
         from scholar_analysis.pipeline.orchestrator import Orchestrator
+
         logger.info("Initializing Orchestrator (first call)")
         try:
             _orchestrator = Orchestrator()
@@ -43,17 +47,30 @@ def _get_semaphore() -> asyncio.Semaphore:
 
 
 def safe_tool(func):
-    """Wrap a tool function to catch exceptions and return structured errors."""
+    """Wrap a tool function to catch exceptions and return structured errors.
+
+    Exception details (may contain internal URLs/config) go to the server log
+    only; the client gets a fixed message plus a log reference id.
+    """
+
     @wraps(func)
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
-        except Exception as e:
-            logger.exception("Tool %s failed", func.__name__)
-            return json.dumps({
-                "status": "error",
-                "error": str(e),
-            }, ensure_ascii=False)
+        except Exception:
+            ref = uuid.uuid4().hex[:8]
+            logger.exception("Tool %s failed [ref=%s]", func.__name__, ref)
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": (
+                        f"Internal error in {func.__name__} [ref={ref}]. "
+                        f"Details are in the server log; contact the administrator."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
     return wrapper
 
 
@@ -66,10 +83,46 @@ def create_mcp_sse_app(settings: Settings | None = None):
     s = settings or get_settings()
     logger.info(
         "Creating MCP SSE app: host=%s port=%d access_token=%s",
-        s.host, s.port, "configured" if s.access_token else "NONE (unauthenticated!)",
+        s.host,
+        s.port,
+        "configured" if s.access_token else "NONE (unauthenticated!)",
     )
     inner_app = mcp.sse_app()
-    app = Starlette(routes=[Mount("/", app=inner_app)])
+
+    from scholar_analysis.pipeline.temp_manager import cleanup_loop
+
+    @asynccontextmanager
+    async def lifespan(app):
+        cleanup_task = None
+        if s.cleanup_interval_seconds > 0:
+            cleanup_task = asyncio.create_task(
+                cleanup_loop(
+                    s.temp_dir,
+                    s.cleanup_interval_seconds,
+                    s.request_max_age_seconds,
+                )
+            )
+            logger.info(
+                "Started temp cleanup task: interval=%ss max_age=%ss dir=%s",
+                s.cleanup_interval_seconds,
+                s.request_max_age_seconds,
+                s.temp_dir,
+            )
+        try:
+            yield
+        finally:
+            if cleanup_task is not None:
+                cleanup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cleanup_task
+                logger.info("Temp cleanup task stopped")
+            # Close the shared httpx client used by the PostProcessor (if instantiated).
+            orch = _orchestrator
+            if orch is not None:
+                with contextlib.suppress(Exception):
+                    await orch._post_processor.aclose()
+
+    app = Starlette(routes=[Mount("/", app=inner_app)], lifespan=lifespan)
 
     if not s.access_token:
         logger.warning("No access token configured — MCP endpoint is UNAUTHENTICATED")
