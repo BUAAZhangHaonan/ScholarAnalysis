@@ -6,7 +6,7 @@ import logging
 import shutil
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,9 @@ class RequestContext:
     request_id: str
     created_at: float
     temp_dir: Path
-    status: str = "pending"  # pending → downloading → parsing → processing → completed/failed
+    status: str = (
+        "pending"  # pending → downloading → parsing → processing → completed/failed
+    )
 
 
 class RequestTracker:
@@ -51,7 +53,12 @@ class RequestTracker:
                 shutil.rmtree(ctx.temp_dir)
                 logger.info("[REQ %s] Cleaned up temp_dir=%s", request_id, ctx.temp_dir)
             except OSError as exc:
-                logger.error("[REQ %s] Failed to clean temp_dir=%s: %s", request_id, ctx.temp_dir, exc)
+                logger.error(
+                    "[REQ %s] Failed to clean temp_dir=%s: %s",
+                    request_id,
+                    ctx.temp_dir,
+                    exc,
+                )
 
     async def cleanup_expired(self) -> int:
         """Remove contexts older than max_age. Returns count cleaned."""

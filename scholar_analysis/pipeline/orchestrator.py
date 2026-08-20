@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -29,14 +30,10 @@ class Orchestrator:
             base_url=self._settings.arxiv_mirror_base_url,
             timeout=self._settings.http_timeout,
         )
-        self._mineru = MinerUClient(
-            base_url=self._settings.mineru_base_url,
-            username=self._settings.mineru_username,
-            password=self._settings.mineru_password,
-            timeout=self._settings.http_timeout,
-        )
+        self._mineru = MinerUClient.from_settings(self._settings)
         self._post_processor = PostProcessor()
         self._arxiv_data_dir = Path(self._settings.arxiv_mirror_data_dir)
+        self._parse_sem = asyncio.Semaphore(self._settings.max_concurrent_parses)
 
     async def get_paper_text(
         self,
@@ -47,48 +44,69 @@ class Orchestrator:
         timings: dict[str, float] = {}
         ctx = await self._tracker.create()
         rid = ctx.request_id
-        logger.info("[REQ %s] get_paper_text query=%s include_images=%s", rid, query, include_images)
+        logger.info(
+            "[REQ %s] get_paper_text query=%s include_images=%s",
+            rid,
+            query,
+            include_images,
+        )
 
         try:
             # Step 1: Resolve + download PDF via arxiv_mirror
             ctx.status = "downloading"
             t0 = time.monotonic()
 
-            info = await self._arxiv.resolve(query)
-            logger.info("[REQ %s] Resolved: id=%s title=%s", rid, info.arxiv_id, info.title[:80] if info.title else "(no title)")
-
-            asset = await self._arxiv.download(query)
-            timings["download_s"] = round(time.monotonic() - t0, 2)
-            logger.info(
-                "[REQ %s] Download complete in %.2fs (versioned_id=%s, path=%s, size=%d)",
-                rid, timings["download_s"], asset.versioned_id, asset.local_path, asset.file_size,
-            )
-
-            # Step 2: Parse PDF via MinerU
-            ctx.status = "parsing"
-            t1 = time.monotonic()
-
-            pdf_path = self._arxiv_data_dir / asset.local_path
-            if not pdf_path.exists():
-                raise ArxivMirrorError(
-                    f"PDF file not found at {pdf_path}. "
-                    f"arxiv_mirror data_dir may be misconfigured."
+            async with asyncio.timeout(self._settings.request_max_age_seconds):
+                info = await self._arxiv.resolve(query)
+                logger.info(
+                    "[REQ %s] Resolved: id=%s title=%s",
+                    rid,
+                    info.arxiv_id,
+                    info.title[:80] if info.title else "(no title)",
                 )
 
-            parse_result = await self._mineru.parse_pdf(
-                pdf_path,
-                text_only=not include_images,
-            )
-            markdown = extract_markdown(parse_result, text_only=not include_images)
-
-            timings["parse_s"] = round(time.monotonic() - t1, 2)
-            logger.info("[REQ %s] Parsed text: %d chars in %.2fs", rid, len(markdown), timings["parse_s"])
-
-            if not markdown:
-                raise RuntimeError(
-                    f"MinerU parsing returned empty markdown for {asset.versioned_id}. "
-                    f"Parse result keys: {list(parse_result.keys())}"
+                asset = await self._arxiv.download(query)
+                timings["download_s"] = round(time.monotonic() - t0, 2)
+                logger.info(
+                    "[REQ %s] Download complete in %.2fs (versioned_id=%s, path=%s, size=%d)",
+                    rid,
+                    timings["download_s"],
+                    asset.versioned_id,
+                    asset.local_path,
+                    asset.file_size,
                 )
+
+                # Step 2: Parse PDF via MinerU
+                ctx.status = "parsing"
+                t1 = time.monotonic()
+
+                pdf_path = self._arxiv_data_dir / asset.local_path
+                if not pdf_path.exists():
+                    raise ArxivMirrorError(
+                        f"PDF file not found at {pdf_path}. "
+                        f"arxiv_mirror data_dir may be misconfigured."
+                    )
+
+                async with self._parse_sem:
+                    parse_result = await self._mineru.parse_pdf(
+                        pdf_path,
+                        text_only=not include_images,
+                    )
+                markdown = extract_markdown(parse_result, text_only=not include_images)
+
+                timings["parse_s"] = round(time.monotonic() - t1, 2)
+                logger.info(
+                    "[REQ %s] Parsed text: %d chars in %.2fs",
+                    rid,
+                    len(markdown),
+                    timings["parse_s"],
+                )
+
+                if not markdown:
+                    raise RuntimeError(
+                        f"MinerU parsing returned empty markdown for {asset.versioned_id}. "
+                        f"Parse result keys: {list(parse_result.keys())}"
+                    )
 
             ctx.status = "completed"
             timings["total_s"] = round(time.monotonic() - t0, 2)
@@ -111,6 +129,19 @@ class Orchestrator:
             ctx.status = "failed"
             logger.error("[REQ %s] arxiv_mirror error: %s", rid, e)
             return _error_result(rid, str(e), timings)
+        except TimeoutError:
+            ctx.status = "failed"
+            logger.error(
+                "[REQ %s] get_paper_text timed out after %.0fs",
+                rid,
+                self._settings.request_max_age_seconds,
+            )
+            return _error_result(
+                rid,
+                f"Request {rid} timed out after {self._settings.request_max_age_seconds:.0f}s "
+                f"(download + parse pipeline deadline exceeded)",
+                timings,
+            )
         except Exception as e:
             ctx.status = "failed"
             logger.exception("[REQ %s] get_paper_text failed", rid)
@@ -131,7 +162,10 @@ class Orchestrator:
         rid = ctx.request_id
         logger.info(
             "[REQ %s] analyze_paper query=%s question=%s language=%s",
-            rid, query, question[:80], language,
+            rid,
+            query,
+            question[:80],
+            language,
         )
 
         try:
@@ -139,48 +173,62 @@ class Orchestrator:
             ctx.status = "downloading"
             t0 = time.monotonic()
 
-            info = await self._arxiv.resolve(query)
-            logger.info("[REQ %s] Resolved: id=%s title=%s", rid, info.arxiv_id, info.title[:80] if info.title else "(no title)")
-
-            asset = await self._arxiv.download(query)
-            timings["download_s"] = round(time.monotonic() - t0, 2)
-            logger.info("[REQ %s] Download complete in %.2fs", rid, timings["download_s"])
-
-            # Step 2: Parse PDF via MinerU
-            ctx.status = "parsing"
-            t1 = time.monotonic()
-
-            pdf_path = self._arxiv_data_dir / asset.local_path
-            if not pdf_path.exists():
-                raise ArxivMirrorError(
-                    f"PDF file not found at {pdf_path}. "
-                    f"arxiv_mirror data_dir may be misconfigured."
+            async with asyncio.timeout(self._settings.request_max_age_seconds):
+                info = await self._arxiv.resolve(query)
+                logger.info(
+                    "[REQ %s] Resolved: id=%s title=%s",
+                    rid,
+                    info.arxiv_id,
+                    info.title[:80] if info.title else "(no title)",
                 )
 
-            parse_result = await self._mineru.parse_pdf(
-                pdf_path,
-                text_only=not include_images,
-            )
-            markdown = extract_markdown(parse_result, text_only=not include_images)
-
-            timings["parse_s"] = round(time.monotonic() - t1, 2)
-            logger.info("[REQ %s] Parsed text: %d chars in %.2fs", rid, len(markdown), timings["parse_s"])
-
-            if not markdown:
-                raise RuntimeError(
-                    f"MinerU parsing returned empty markdown for {asset.versioned_id}. "
-                    f"Parse result keys: {list(parse_result.keys())}"
+                asset = await self._arxiv.download(query)
+                timings["download_s"] = round(time.monotonic() - t0, 2)
+                logger.info(
+                    "[REQ %s] Download complete in %.2fs", rid, timings["download_s"]
                 )
 
-            # Step 3: LLM analysis
-            ctx.status = "processing"
-            t2 = time.monotonic()
-            analysis = await self._post_processor.extract(
-                markdown=markdown,
-                question=question,
-                language=language,
-            )
-            timings["llm_s"] = round(time.monotonic() - t2, 2)
+                # Step 2: Parse PDF via MinerU
+                ctx.status = "parsing"
+                t1 = time.monotonic()
+
+                pdf_path = self._arxiv_data_dir / asset.local_path
+                if not pdf_path.exists():
+                    raise ArxivMirrorError(
+                        f"PDF file not found at {pdf_path}. "
+                        f"arxiv_mirror data_dir may be misconfigured."
+                    )
+
+                async with self._parse_sem:
+                    parse_result = await self._mineru.parse_pdf(
+                        pdf_path,
+                        text_only=not include_images,
+                    )
+                markdown = extract_markdown(parse_result, text_only=not include_images)
+
+                timings["parse_s"] = round(time.monotonic() - t1, 2)
+                logger.info(
+                    "[REQ %s] Parsed text: %d chars in %.2fs",
+                    rid,
+                    len(markdown),
+                    timings["parse_s"],
+                )
+
+                if not markdown:
+                    raise RuntimeError(
+                        f"MinerU parsing returned empty markdown for {asset.versioned_id}. "
+                        f"Parse result keys: {list(parse_result.keys())}"
+                    )
+
+                # Step 3: LLM analysis
+                ctx.status = "processing"
+                t2 = time.monotonic()
+                analysis = await self._post_processor.extract(
+                    markdown=markdown,
+                    question=question,
+                    language=language,
+                )
+                timings["llm_s"] = round(time.monotonic() - t2, 2)
 
             # Validate analysis shape
             required_keys = {"answer", "model_used", "backend", "token_usage"}
@@ -194,7 +242,12 @@ class Orchestrator:
             ctx.status = "completed"
             timings["total_s"] = round(time.monotonic() - t0, 2)
 
-            logger.info("[REQ %s] Analysis complete in %.2fs (llm=%.2fs)", rid, timings["total_s"], timings["llm_s"])
+            logger.info(
+                "[REQ %s] Analysis complete in %.2fs (llm=%.2fs)",
+                rid,
+                timings["total_s"],
+                timings["llm_s"],
+            )
 
             return {
                 "request_id": rid,
@@ -219,6 +272,19 @@ class Orchestrator:
             ctx.status = "failed"
             logger.error("[REQ %s] arxiv_mirror error: %s", rid, e)
             return _error_result(rid, str(e), timings)
+        except TimeoutError:
+            ctx.status = "failed"
+            logger.error(
+                "[REQ %s] analyze_paper timed out after %.0fs",
+                rid,
+                self._settings.request_max_age_seconds,
+            )
+            return _error_result(
+                rid,
+                f"Request {rid} timed out after {self._settings.request_max_age_seconds:.0f}s "
+                f"(download + parse + LLM pipeline deadline exceeded)",
+                timings,
+            )
         except Exception as e:
             ctx.status = "failed"
             logger.exception("[REQ %s] analyze_paper failed", rid)
@@ -227,7 +293,9 @@ class Orchestrator:
             await self._tracker.remove(rid)
 
 
-def _error_result(request_id: str, error: str, timing: dict[str, float]) -> dict[str, Any]:
+def _error_result(
+    request_id: str, error: str, timing: dict[str, float]
+) -> dict[str, Any]:
     logger.error("[REQ %s] Returning error: %s", request_id, error)
     return {
         "request_id": request_id,
