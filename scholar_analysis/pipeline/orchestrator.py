@@ -12,6 +12,7 @@ from scholar_analysis.clients.arxiv_mirror import ArxivMirrorClient, ArxivMirror
 from scholar_analysis.clients.mineru import MinerUClient, extract_markdown
 from scholar_analysis.config import get_settings
 from scholar_analysis.llm.post_processor import PostProcessor
+from scholar_analysis.pipeline.parse_cache import ParseCache
 from scholar_analysis.pipeline.request_context import RequestTracker
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,10 @@ class Orchestrator:
         self._post_processor = PostProcessor()
         self._arxiv_data_dir = Path(self._settings.arxiv_mirror_data_dir)
         self._parse_sem = asyncio.Semaphore(self._settings.max_concurrent_parses)
+        self._parse_cache = ParseCache(
+            self._settings.parse_cache_dir,
+            self._settings.parse_cache_max_bytes,
+        )
 
     async def aclose(self) -> None:
         """Close shared resources (httpx clients, model pool)."""
@@ -46,6 +51,20 @@ class Orchestrator:
                 await closer()
             except Exception:
                 logger.exception("Error closing orchestrator resource %s", closer)
+
+    async def _parse_with_cache(
+        self, rid: str, versioned_id: str, pdf_path: Path
+    ) -> dict[str, Any]:
+        """Fetch MinerU parse result from cache, else parse and cache it."""
+        cached = await self._parse_cache.get(versioned_id)
+        if cached is not None:
+            logger.info("[REQ %s] parse cache hit: %s", rid, versioned_id)
+            return cached
+        logger.info("[REQ %s] parse cache miss: %s", rid, versioned_id)
+        async with self._parse_sem:
+            result = await self._mineru.parse_pdf(pdf_path)
+        await self._parse_cache.put(versioned_id, "", result)
+        return result
 
     async def get_paper_text(
         self,
@@ -99,11 +118,9 @@ class Orchestrator:
                         f"arxiv_mirror data_dir may be misconfigured."
                     )
 
-                async with self._parse_sem:
-                    parse_result = await self._mineru.parse_pdf(
-                        pdf_path,
-                        text_only=not include_images,
-                    )
+                parse_result = await self._parse_with_cache(
+                    rid, asset.versioned_id, pdf_path
+                )
                 markdown = extract_markdown(parse_result, text_only=not include_images)
 
                 timings["parse_s"] = round(time.monotonic() - t1, 2)
@@ -211,11 +228,9 @@ class Orchestrator:
                         f"arxiv_mirror data_dir may be misconfigured."
                     )
 
-                async with self._parse_sem:
-                    parse_result = await self._mineru.parse_pdf(
-                        pdf_path,
-                        text_only=not include_images,
-                    )
+                parse_result = await self._parse_with_cache(
+                    rid, asset.versioned_id, pdf_path
+                )
                 markdown = extract_markdown(parse_result, text_only=not include_images)
 
                 timings["parse_s"] = round(time.monotonic() - t1, 2)

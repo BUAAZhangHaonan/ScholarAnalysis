@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     arxiv_mirror_base_url: str = "http://127.0.0.1:8900/api/v1"
     arxiv_mirror_data_dir: str = ""
 
+    # Parse result disk cache
+    parse_cache_dir: str = "data/parse_cache"
+    parse_cache_max_bytes: int = 2 * 1024**3
+
     # MinerU — legacy single-URL fields (kept for backward compatibility)
     mineru_base_url: str | None = None
     mineru_username: str = ""
@@ -62,7 +66,9 @@ class Settings(BaseSettings):
 
     # GLM (fallback)
     bigmodel_api_key: str = ""
-    bigmodel_base_url: str = "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+    bigmodel_base_url: str = (
+        "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+    )
     bigmodel_model: str = "glm-5-turbo"
     bigmodel_max_concurrent: int = 3
 
@@ -105,7 +111,9 @@ class Settings(BaseSettings):
             self.mineru_creds_list = creds
         elif self.mineru_base_url:
             self.mineru_endpoints_list = [self.mineru_base_url]
-            self.mineru_creds_list = [(self.mineru_username or "", self.mineru_password or "")]
+            self.mineru_creds_list = [
+                (self.mineru_username or "", self.mineru_password or "")
+            ]
         else:
             self.mineru_endpoints_list = []
             self.mineru_creds_list = []
