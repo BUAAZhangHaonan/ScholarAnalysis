@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any
+
 
 import httpx
 
@@ -62,9 +62,7 @@ class ArxivMirrorClient:
             data = r.json()
 
             if data.get("error"):
-                raise ArxivMirrorError(
-                    f"Resolve failed for {query!r}: {data['error']}"
-                )
+                raise ArxivMirrorError(f"Resolve failed for {query!r}: {data['error']}")
 
             state = data.get("state", "")
             if state == "not_found":
@@ -111,7 +109,8 @@ class ArxivMirrorClient:
 
             logger.info(
                 "[arxiv_mirror] Download started for %s (versioned_id=%s)",
-                query, versioned_id,
+                query,
+                versioned_id,
             )
 
             dl_status = ""
@@ -128,11 +127,23 @@ class ArxivMirrorClient:
                     if e.response.status_code == 500:
                         logger.warning(
                             "[arxiv_mirror] Poll %d/%d for %s: 500 (server still processing), retrying",
-                            attempt + 1, max_polls, versioned_id,
+                            attempt + 1,
+                            max_polls,
+                            versioned_id,
                         )
                         await asyncio.sleep(5)
                         continue
                     raise
+                except httpx.RequestError as e:
+                    logger.warning(
+                        "[arxiv_mirror] Poll %d/%d for %s: connection error (%s), retrying",
+                        attempt + 1,
+                        max_polls,
+                        versioned_id,
+                        e,
+                    )
+                    await asyncio.sleep(5)
+                    continue
 
                 dl_status = status.get("download_status", "")
 
@@ -143,7 +154,10 @@ class ArxivMirrorClient:
 
                 logger.info(
                     "[arxiv_mirror] Poll %d/%d for %s: download=%s",
-                    attempt + 1, max_polls, versioned_id, dl_status,
+                    attempt + 1,
+                    max_polls,
+                    versioned_id,
+                    dl_status,
                 )
 
                 if dl_status == "failed":
