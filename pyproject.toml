@@ -23,3 +23,6 @@ include = ["scholar_analysis*"]
 
 [project.scripts]
 scholar-analysis = "scholar_analysis.main:main"
+
+[tool.setuptools.package-data]
+scholar_analysis = ["prompts/*.yaml"]

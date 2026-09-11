@@ -127,10 +127,10 @@ class ModelPool:
             f"Cooldown: {cooldown_models}, Busy: {busy_models}"
         )
 
-    def release(self, entry: ModelPoolEntry, *, success: bool) -> None:
-        if success:
+    def release(self, entry: ModelPoolEntry, *, success: bool | None) -> None:
+        if success is True:
             entry.record_success()
-        else:
+        elif success is False:
             entry.record_error()
         entry.semaphore.release()
 
@@ -146,7 +146,7 @@ class ModelPool:
     def _build(settings: Settings) -> ModelPool:
         entries: list[ModelPoolEntry] = []
 
-        # Primary: DeepSeek V4 Flash (thinking mode, 256K context)
+        # Primary: explicitly configured DeepSeek model (Flash by default)
         if settings.deepseek_api_key.strip():
             entries.append(
                 ModelPoolEntry(
@@ -160,39 +160,8 @@ class ModelPool:
                 )
             )
 
-        # Fallback: GLM
-        if settings.bigmodel_api_key.strip():
-            entries.append(
-                ModelPoolEntry(
-                    backend="glm",
-                    model=settings.bigmodel_model,
-                    api_key=settings.bigmodel_api_key,
-                    base_url=settings.bigmodel_base_url,
-                    max_concurrent=settings.bigmodel_max_concurrent,
-                    context_tokens=128_000,
-                    semaphore=asyncio.Semaphore(settings.bigmodel_max_concurrent),
-                )
-            )
-
-        # Fallback: Qwen (local vLLM) — gate on base_url; api_key may be empty for open access
-        if settings.qwen_base_url.strip():
-            logger.info(
-                "Adding Qwen backend: base_url=%s, api_key=%s",
-                settings.qwen_base_url,
-                "set" if settings.qwen_api_key.strip() else "empty (open access)",
-            )
-            entries.append(
-                ModelPoolEntry(
-                    backend="qwen",
-                    model=settings.qwen_model,
-                    api_key=settings.qwen_api_key,
-                    base_url=settings.qwen_base_url,
-                    max_concurrent=settings.qwen_max_concurrent,
-                    context_tokens=32_768,
-                    semaphore=asyncio.Semaphore(settings.qwen_max_concurrent),
-                )
-            )
-
+        # One explicitly configured model per deployment. Account peak capacity
+        # is not a worker default; Pro is selected through deepseek_model only.
         if not entries:
             logger.error(
                 "ModelPool built with ZERO entries — no LLM backends configured. "
