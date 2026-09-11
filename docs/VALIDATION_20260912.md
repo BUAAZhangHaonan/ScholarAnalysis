@@ -62,3 +62,25 @@ requests. Credentials are read only from the environment and are absent from rep
   in ReadWritePaths, remove that obsolete entry before restarting.
 - Restart the service, verify real advertised MCP parameters and authenticated calls.
 - Confirm production calls preserve the same usage, range and evidence contracts; the isolated live analysis above already passed.
+
+## Production client authentication correction
+
+The first coordinator-run live CLI inherited no shell access token, while systemd
+loaded the production service token from EnvironmentFile. GET /sse was allowed by
+the handshake policy, but POST /messages returned 401. The SDK logged the failed
+POST while initialization kept waiting. This was a test-client credential-loading
+and failure-propagation defect, not a changed production token.
+
+The CLI now reads the shell token first, then the repository .env or --env-file.
+It fails before connecting when credentials are absent (unless --no-auth was
+explicitly requested), watches HTTP 401/403, and bounds the whole MCP session.
+No production credential or service restart was needed for this correction.
+
+Five client-only regression tests passed: .env loading without exported variables,
+shell precedence, missing-token behavior, GET 200 plus POST 401 terminating
+promptly, and a stalled-session deadline. Tests use fixture credentials and mocked
+HTTP transport.
+
+The corrected CLI was run against the already-restarted production service:
+1409.1556v1, 16 requests, concurrency 8. Results: 16 successful, 0 degraded,
+0 failed; p50 0.172s, p95 0.217s; zero model calls and zero provider API cost.

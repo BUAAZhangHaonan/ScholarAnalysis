@@ -115,8 +115,10 @@ venv/bin/python scripts/stress_test.py --live --url http://127.0.0.1:8005 \
   --pdf-url https://aclanthology.org/2024.findings-acl.212.pdf --requests 4 --concurrency 4
 ```
 
-The CLI reads SCHOLAR_ANALYSIS_ACCESS_TOKEN from the environment, never prints it.
-Live model calls additionally require --analysis --allow-paid-analysis.
+The CLI reads SCHOLAR_ANALYSIS_ACCESS_TOKEN from the shell first, then this
+repository's .env (or --env-file). It never prints credentials. Missing credentials
+fail before connecting; HTTP 401/403 ends the session promptly. --no-auth is only
+for deliberately unauthenticated test endpoints. Live model calls additionally require --analysis --allow-paid-analysis.
 By default analysis requests share one ID to test idempotency; add
 --distinct-analysis-ids for separately authorized parallel generations.
 Reports include semantic checks, p50/p95 latency, success/degraded/failure counts,

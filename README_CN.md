@@ -88,8 +88,9 @@ venv/bin/python scripts/stress_test.py --live --url http://127.0.0.1:8005 \
   --pdf-url https://aclanthology.org/2024.findings-acl.212.pdf --requests 4 --concurrency 4
 ```
 
-CLI 从环境读取 SCHOLAR_ANALYSIS_ACCESS_TOKEN，不打印凭据。
-真实分析必须另传 --analysis --allow-paid-analysis。
+CLI 优先读取 shell 的 SCHOLAR_ANALYSIS_ACCESS_TOKEN，随后读取仓库 .env
+（也可用 --env-file 指定）。不打印凭据；缺少凭据时连接前退出，401/403 及时退出。
+--no-auth 仅用于明确未启用认证的测试端点。真实分析必须另传 --analysis --allow-paid-analysis。
 默认多个分析请求共享一个 ID 以验证不重复生成；明确需要独立生成时加
 --distinct-analysis-ids。输出含语义检查、p50/p95、成功/退化/失败数量、
 去重模型请求及费用上下界。验收事实见 [验证记录](docs/VALIDATION_20260912.md)。

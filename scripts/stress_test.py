@@ -35,27 +35,90 @@ def check_cost(value):
     else:
         assert cost["total_cny"] is None
 
-async def live(args):
+class ClientFailure(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+def client_headers(env_file=None, no_auth=False):
+    """Use the deployment's configuration without printing or changing secrets."""
+    if no_auth:
+        return {}
+    token = os.environ.get("SCHOLAR_ANALYSIS_ACCESS_TOKEN", "").strip()
+    if not token:
+        from scholar_analysis.config import Settings
+        path = env_file or Path(__file__).resolve().parents[1]/".env"
+        token = Settings(_env_file=path).access_token.strip()
+    if not token:
+        raise ClientFailure("AUTH_TOKEN_MISSING",
+            "No client token configured. Set SCHOLAR_ANALYSIS_ACCESS_TOKEN or --env-file. "
+            "Use --no-auth only for a deliberately unauthenticated endpoint.")
+    return {"Authorization": "Bearer "+token}
+
+async def call_mcp(base_url, headers, timeout, tool, arguments):
     from mcp import ClientSession
     from mcp.client.sse import sse_client
-    token = os.environ.get("SCHOLAR_ANALYSIS_ACCESS_TOKEN", "")
-    headers = {"Authorization": "Bearer "+token} if token else {}
-    async def call(tool, arguments):
-        async with sse_client(args.url.rstrip("/")+"/sse", headers=headers,
-                              timeout=30, sse_read_timeout=args.timeout) as (read, write):
+    from mcp.shared._httpx_utils import create_mcp_http_client
+    rejected = asyncio.Event()
+
+    async def check_auth(response):
+        if response.status_code in (401, 403):
+            rejected.set()
+
+    def client_factory(**kwargs):
+        client = create_mcp_http_client(**kwargs)
+        client.event_hooks.setdefault("response", []).append(check_auth)
+        return client
+
+    async def exchange():
+        async with sse_client(base_url.rstrip("/")+"/sse", headers=headers,
+                              timeout=min(30, timeout), sse_read_timeout=timeout,
+                              httpx_client_factory=client_factory) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                # The SDK logs POST failures but may leave initialization waiting.
+                await asyncio.wait_for(session.initialize(), timeout=min(30, timeout))
                 result = await session.call_tool(tool, arguments)
                 if result.isError:
-                    raise RuntimeError("MCP transport/tool wrapper returned an error")
+                    raise ClientFailure("MCP_TOOL_ERROR", "MCP tool wrapper returned an error.")
                 text = next((b.text for b in result.content if b.type == "text"), "")
                 value = json.loads(text)
                 check_cost(value)
                 return value
 
+    request = asyncio.create_task(exchange())
+    auth_wait = asyncio.create_task(rejected.wait())
+    try:
+        async with asyncio.timeout(timeout):
+            done, _ = await asyncio.wait((request, auth_wait), return_when=asyncio.FIRST_COMPLETED)
+            if rejected.is_set():
+                raise ClientFailure("AUTH_REJECTED",
+                    "MCP returned HTTP 401/403. Verify the client environment or --env-file; the service token was not changed.")
+            return await request
+    except TimeoutError as exc:
+        raise ClientFailure("MCP_CLIENT_TIMEOUT", "MCP client session exceeded its deadline.") from exc
+    finally:
+        for task in (request, auth_wait):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(request, auth_wait, return_exceptions=True)
+
+async def live(args):
+    try:
+        headers = client_headers(args.env_file, args.no_auth)
+    except ClientFailure as exc:
+        return {"mode":"live", "passed":False, "error_code":exc.code, "error":str(exc), "requests":[]}
+    async def call(tool, arguments):
+        return await call_mcp(args.url, headers, args.timeout, tool, arguments)
+
     source = {"pdf_url": args.pdf_url} if args.pdf_url else {"query": args.query}
     warm_start = time.monotonic()
-    first = await call("get_paper_text", {**source, "limit_chars": 1000})
+    try:
+        first = await call("get_paper_text", {**source, "limit_chars": 1000})
+    except Exception as exc:
+        return {"mode":"live", "passed":False, "requests":[],
+                "warmup":{"status":"error", "error_code":getattr(exc, "code", type(exc).__name__),
+                          "seconds":round(time.monotonic()-warm_start, 3)},
+                "error":str(exc) if isinstance(exc, ClientFailure) else "MCP warmup failed."}
     warmup = {"seconds": round(time.monotonic()-warm_start, 3), "status": first.get("status"),
               "error_code": first.get("error_code"), "stage": first.get("stage"),
               "total_chars": first.get("total_chars"), "source": first.get("source"), "cost": first["cost"]}
@@ -101,7 +164,7 @@ async def live(args):
                         "evidence_count":len(result.get("analysis",{}).get("evidence",[])),
                         "cost":result["cost"]}
             except Exception as exc:
-                return {"index":index, "status":"error", "error_code":type(exc).__name__,
+                return {"index":index, "status":"error", "error_code":getattr(exc, "code", type(exc).__name__),
                         "seconds":round(time.monotonic()-started, 3)}
     results = await asyncio.gather(*(one(i) for i in range(args.requests)))
     # Sum actual incremental attempts once, including unknown/failed requests.
@@ -129,6 +192,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--url", help="MCP server base URL, without /sse")
+    parser.add_argument("--env-file", type=Path,
+                        help="Client .env file; defaults to this repository's .env. Environment token wins.")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="Explicitly use an unauthenticated test endpoint; never changes server configuration.")
     parser.add_argument("--query", default="2402.01306")
     parser.add_argument("--pdf-url")
     parser.add_argument("--requests", type=int, default=4)
@@ -143,6 +210,8 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.concurrency <= 64 or not 1 <= args.requests <= 1000:
         parser.error("concurrency must be 1..64 and requests 1..1000; do not use account capacity as worker count")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
     if args.live:
         if not args.url:
             parser.error("--live requires --url")
