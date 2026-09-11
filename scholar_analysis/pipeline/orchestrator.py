@@ -149,15 +149,16 @@ class Orchestrator:
 
     @costed
     async def get_paper_text(self, query="", include_images=False, *, pdf_url=None,
-                             document_id=None, offset=0, limit_chars=64000,
+                             document_id=None, offset=0, limit_chars=None,
                              find_text=None, lang="", refresh=False):
         rid, start = uuid.uuid4().hex, time.monotonic()
         try:
-            if isinstance(offset, bool) or offset < 0 or not 1 <= limit_chars <= 64000:
+            limit = (4000 if find_text is not None else 64000) if limit_chars is None else limit_chars
+            if isinstance(offset, bool) or offset < 0 or isinstance(limit, bool) or not 1 <= limit <= 64000:
                 raise PipelineError("INVALID_RANGE", "input", "offset must be nonnegative and limit_chars between 1 and 64000.")
             result, document, cache_hit = await self._load(query, pdf_url, document_id, lang=lang, refresh=refresh)
             markdown = extract_markdown(result, text_only=not include_images)
-            body = read_slice(markdown, offset, limit_chars, find_text)
+            body = read_slice(markdown, offset, limit, find_text)
             return {"request_id": rid, "status": "success", "paper": result.get("_paper", {"arxiv_id": document, "versioned_id": document}),
                     "document_id": document, "document_revision": result.get("_revision") or "legacy:"+document,
                     "source": result.get("_source") or ({"original_url": "https://arxiv.org/abs/"+document,
@@ -251,6 +252,7 @@ def read_slice(text: str, offset: int, limit: int, find_text: str | None = None)
     if offset > len(text):
         raise PipelineError("INVALID_RANGE", "input", "offset exceeds document length.")
     matches = []
+    search_start = offset
     if find_text is not None:
         if not find_text:
             raise PipelineError("INVALID_INPUT", "input", "find_text must not be empty.")
@@ -259,8 +261,17 @@ def read_slice(text: str, offset: int, limit: int, find_text: str | None = None)
             matches.append({"start": pos, "end": pos+len(find_text),
                             "line": text.count("\n", 0, pos)+1})
             pos = text.find(find_text, pos+max(1, len(find_text)))
-        if matches:
-            offset = max(offset, matches[0]["start"] - min(400, limit//4))
+        if not matches:
+            line = text.count("\n", 0, offset)+1
+            return {"markdown": "", "range": {"start": offset, "end": offset},
+                    "total_chars": len(text), "next_offset": None, "eof": offset == len(text),
+                    "truncated": True, "coverage": "no_text_returned",
+                    "line_range": {"start": line, "end": line}, "sections": [], "matches": [],
+                    "match_status": "no_match", "no_match": True,
+                    "search_range": {"start": search_start, "end": len(text)},
+                    "page_numbers_available": False,
+                    "locator_basis": "Unicode character offsets and Markdown lines in the requested image mode"}
+        offset = max(offset, matches[0]["start"] - min(400, limit//4))
     end = min(len(text), offset+limit)
     headings = []
     current = None
@@ -278,4 +289,6 @@ def read_slice(text: str, offset: int, limit: int, find_text: str | None = None)
             "coverage": "full_parsed_text" if offset == 0 and end == len(text) else "partial_parsed_text",
             "line_range": {"start": text.count("\n", 0, offset)+1, "end": text.count("\n", 0, end)+1},
             "sections": headings, "matches": matches, "page_numbers_available": False,
+            "match_status": "matched" if find_text is not None else "not_requested", "no_match": False,
+            "search_range": {"start": search_start, "end": len(text)} if find_text is not None else None,
             "locator_basis": "Unicode character offsets and Markdown lines in the requested image mode"}

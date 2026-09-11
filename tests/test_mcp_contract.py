@@ -31,6 +31,12 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orch.get_paper_text.call_args.kwargs["offset"], 2)
         self.assertEqual(self.module._pipeline_sem._value, 1)
         self.assertTrue(result["cost"]["reused_result"])
+    async def test_omitted_read_limit_is_forwarded_as_none(self):
+        orch = AsyncMock()
+        orch.get_paper_text.return_value = {"status":"success","cache_hit":True,"markdown":"window"}
+        with patch.object(self.module, "_get_orchestrator", return_value=orch):
+            await self.module.get_paper_text(document_id="doc_test", find_text="method")
+        self.assertIsNone(orch.get_paper_text.call_args.kwargs["limit_chars"])
     async def test_tool_exception_has_public_contract(self):
         with patch.object(self.module, "_get_orchestrator", side_effect=RuntimeError("internal fixture")), \
              self.assertLogs("scholar_analysis.mcp_server", level="ERROR"):

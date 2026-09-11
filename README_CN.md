@@ -29,7 +29,11 @@ pdf_url（PDF 或声明 citation_pdf_url 的出版方页面）、
 ```
 
 返回 document_id 后，用 offset 和 limit_chars 继续阅读。每次最多 64000 字符。
-find_text 从指定 offset 开始定位原文，并返回附近文本。可选 lang 是解析语言提示，
+find_text 从指定 offset 开始定位原文，并返回附近文本。省略 limit_chars 时，
+普通读取默认 64000 字符，关键词命中默认 4000 字符；显式上限仍按用户指定值执行。
+字面量未命中时返回 status=success、match_status=no_match、空正文及
+coverage=no_text_returned，不再回退返回整篇。未命中不等于论文不存在该概念。
+可选 lang 是解析语言提示，
 后续分页应保持相同值。refresh=true 配合原始来源显式重新获取和解析。
 
 返回正文、原始/最终来源 URL、文档版本、字符范围、总长度、下一偏移、

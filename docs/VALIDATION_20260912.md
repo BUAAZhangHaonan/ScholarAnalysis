@@ -84,3 +84,21 @@ HTTP transport.
 The corrected CLI was run against the already-restarted production service:
 1409.1556v1, 16 requests, concurrency 8. Results: 16 successful, 0 degraded,
 0 failed; p50 0.172s, p95 0.217s; zero model calls and zero provider API cost.
+
+## Literal-search window correction
+
+Observed live use showed a missing find_text literal returning the whole 54437-character
+paper, and a successful search returning 62372 characters because the caller omitted
+limit_chars. The tool now distinguishes an omitted limit: ordinary reads default to
+64000 and find_text defaults to 4000. Explicit limits retain their requested value.
+A miss returns success/no_match, zero Markdown characters, an empty returned range,
+the searched character range and no_text_returned coverage. It does not certify absence
+of a concept or full-paper reading.
+
+Twenty-eight targeted document/MCP tests passed, including the new positive, negative,
+offset and explicit-limit cases. A separate process read existing real parser caches
+without downloads, parsing or model calls: "control" in 2604.09364v1 returned 4000
+characters by default and all remaining 62372 with explicit limit_chars=64000; ordinary
+reading returned 64000. The observed "ablat" miss in 2608.11024v1 returned zero characters,
+including when an explicit 64000 limit was provided. Each read took 0.001–0.003 seconds.
+The running service and ARC run state were not changed during this verification.

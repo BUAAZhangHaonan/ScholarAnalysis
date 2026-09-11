@@ -180,7 +180,7 @@ async def _run_pipeline(method: str, **kwargs) -> str:
 @safe_tool
 async def get_paper_text(
     query: str = "", include_images: bool = False, pdf_url: str | None = None,
-    document_id: str | None = None, offset: int = 0, limit_chars: int = 64000,
+    document_id: str | None = None, offset: int = 0, limit_chars: int | None = None,
     find_text: str | None = None, lang: str = "", refresh: bool = False,
 ) -> str:
     """Read parsed paper Markdown with exact character/line/section locations.
@@ -189,6 +189,10 @@ async def get_paper_text(
     previously returned document_id for a cache-only read. Publisher pages need
     a declared citation_pdf_url. No title search. offset/limit_chars page through
     the requested text mode; find_text locates literal text at/after offset.
+    If limit_chars is omitted, ordinary reads return up to 64000 characters,
+    find_text matches up to 4000; explicit limits are respected up to 64000.
+    A missing literal returns match_status=no_match and no Markdown, not a full
+    paper fallback. It does not establish that the paper lacks the concept.
     include_images retains image references, NOT image pixels or visual analysis.
     Coverage describes returned parsed text, never certifies PDF completeness.
     Use refresh with the original source to retry parsing or refresh a snapshot.

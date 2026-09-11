@@ -36,7 +36,12 @@ Continue with the returned document ID and next offset:
 ```
 
 `find_text` performs literal search from offset and returns matching character/line
-locations with surrounding text. `lang` is an optional parser hint; reuse it on
+locations with surrounding text. When limit_chars is omitted, ordinary reads
+default to 64000 characters and find_text to a 4000-character window. Explicit
+limits up to 64000 remain unchanged. A missing literal returns status=success,
+match_status=no_match, empty Markdown and coverage=no_text_returned; it never
+falls back to returning the full paper. This is not evidence that the concept
+is absent. `lang` is an optional parser hint; reuse it on
 subsequent reads. `refresh=true` with the original source explicitly reparses.
 Requests for the same source share in-flight work. Valid cached versions are
 readable without the mirror. An unversioned arXiv query may return its cached
