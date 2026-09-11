@@ -9,6 +9,10 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlsplit
+
+from scholar_analysis.pipeline.errors import PipelineError
 from pathlib import Path
 from typing import Any
 
@@ -143,6 +147,8 @@ class MinerUClient:
                     )
                 r.raise_for_status()
                 result = r.json()
+                if not isinstance(result, dict) or not extract_markdown(result).strip():
+                    raise ValueError("MinerU returned no usable Markdown")
                 logger.info(
                     "[MinerU] endpoint %d/%d succeeded: %s",
                     idx,
@@ -153,7 +159,7 @@ class MinerUClient:
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code if exc.response is not None else 0
                 last_exc = exc
-                if 400 <= status < 500 and status not in (401, 403, 429):
+                if status in (400, 404, 422):
                     # Deterministic client-side failure (e.g. 413 payload too large):
                     # every endpoint would reject the same PDF — don't re-parse.
                     raise MinerUError(
@@ -192,34 +198,72 @@ class MinerUClient:
         ) from last_exc
 
     async def parse_from_url(
-        self,
-        url: str,
-        temp_dir: Path,
-        *,
-        text_only: bool = True,
-        lang_list: str = "",
+        self, url: str, temp_dir: Path, *, text_only: bool = True,
+        lang_list: str = "", max_bytes: int = 50 * 1024 * 1024,
     ) -> dict[str, Any]:
-        """Download PDF from URL, upload to MinerU, return parsed result.
+        """Read a direct PDF or a landing page's declared citation_pdf_url.
 
-        The temp PDF is cleaned up after parsing.
+        Redirects and one explicit publisher PDF link are followed. This does
+        not infer a PDF from arbitrary links or claim paywalled text was read.
         """
         temp_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = temp_dir / f"{uuid.uuid4().hex}.pdf"
-
+        original_url, current = url, url
         try:
-            dl = self._get_download_client()
-            r = await dl.get(url)
-            r.raise_for_status()
-            tmp_path.write_bytes(r.content)
-
-            logger.info(
-                "Downloaded PDF to %s (%d bytes)", tmp_path, tmp_path.stat().st_size
-            )
-            return await self.parse_pdf(
-                tmp_path, text_only=text_only, lang_list=lang_list
-            )
+            for step in range(2):
+                parsed = urlsplit(current)
+                if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+                    raise PipelineError("INVALID_PDF_URL", "pdf_download", "Use an HTTP(S) URL without credentials.")
+                dl = self._get_download_client()
+                try:
+                    async with dl.stream("GET", current, headers={"Accept": "application/pdf,text/html;q=0.8"}) as r:
+                        r.raise_for_status()
+                        final_url = str(r.url)
+                        content = bytearray()
+                        content_type = r.headers.get("content-type", "").lower()
+                        limit = max_bytes if "text/html" not in content_type else min(max_bytes, 2 * 1024 * 1024)
+                        async for chunk in r.aiter_bytes():
+                            content.extend(chunk)
+                            if len(content) > limit:
+                                raise PipelineError("PDF_TOO_LARGE", "pdf_download", "Document exceeds the configured download size limit.")
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code
+                    raise PipelineError("PDF_HTTP_ERROR", "pdf_download", f"Paper server returned HTTP {status}.",
+                                        retryable=status in (429, 500, 502, 503, 504),
+                                        details={"http_status": status}) from exc
+                except httpx.RequestError as exc:
+                    raise PipelineError("PDF_NETWORK_ERROR", "pdf_download", "Paper download failed.",
+                                        retryable=True) from exc
+                if bytes(content[:1024]).lstrip().startswith(b"%PDF-"):
+                    tmp_path.write_bytes(content)
+                    result = await self.parse_pdf(tmp_path, text_only=text_only, lang_list=lang_list)
+                    result["_source"] = {"original_url": original_url, "final_url": final_url,
+                                         "document_type": "pdf", "download_bytes": len(content)}
+                    return result
+                if step == 0:
+                    links = _PDFLinks()
+                    links.feed(bytes(content).decode("utf-8", errors="replace"))
+                    if links.pdf_url:
+                        current = urljoin(final_url, links.pdf_url)
+                        continue
+                raise PipelineError("PDF_LINK_REQUIRED", "pdf_download",
+                                    "No PDF body or declared publisher PDF link was available; provide a direct accessible PDF URL.")
+            raise AssertionError("unreachable")
         finally:
             tmp_path.unlink(missing_ok=True)
+
+
+class _PDFLinks(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.pdf_url = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "meta" and attrs.get("name", "").lower() == "citation_pdf_url":
+            self.pdf_url = attrs.get("content") or self.pdf_url
+        elif tag.lower() == "link" and attrs.get("type", "").lower() == "application/pdf":
+            self.pdf_url = self.pdf_url or attrs.get("href")
 
 
 _IMAGE_REF_RE = re.compile(r"!\[(?:[^\]]|\][^(])*\]\([^)]+\)")
@@ -242,7 +286,7 @@ def extract_markdown(parse_result: dict[str, Any], *, text_only: bool = True) ->
         if not isinstance(v, dict):
             continue
         md = v.get("md_content", "")
-        if md:
+        if isinstance(md, str) and md.strip():
             parts.append(md)
 
     if not parts:
