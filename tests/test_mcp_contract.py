@@ -7,6 +7,7 @@ from scholar_analysis.config import Settings
 
 class MCPContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        asyncio.get_running_loop().slow_callback_duration = 2
         self.settings = Settings(_env_file=None, queue_timeout_seconds=.01, request_max_age_seconds=1)
         with patch("scholar_analysis.config.get_settings", return_value=self.settings):
             self.module = importlib.import_module("scholar_analysis.mcp_server")
@@ -31,7 +32,8 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.module._pipeline_sem._value, 1)
         self.assertTrue(result["cost"]["reused_result"])
     async def test_tool_exception_has_public_contract(self):
-        with patch.object(self.module, "_get_orchestrator", side_effect=RuntimeError("internal fixture")):
+        with patch.object(self.module, "_get_orchestrator", side_effect=RuntimeError("internal fixture")), \
+             self.assertLogs("scholar_analysis.mcp_server", level="ERROR"):
             result = json.loads(await self.module.get_paper_text(query="2401.00001"))
         self.assertEqual(result["error_code"], "INTERNAL_ERROR")
         self.assertNotIn("internal fixture", result["error"])

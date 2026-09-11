@@ -149,6 +149,8 @@ mcp = create_mcp()
 async def _run_pipeline(method: str, **kwargs) -> str:
     from scholar_analysis.pipeline.errors import PipelineError, error_result
     sem = _get_semaphore()
+    if method == "analyze_paper" and not kwargs.get("analysis_id"):
+        kwargs["analysis_id"] = "analysis_"+uuid.uuid4().hex
     settings = get_settings()
     stage = "queue"
     try:
@@ -166,9 +168,12 @@ async def _run_pipeline(method: str, **kwargs) -> str:
             finally:
                 sem.release()
     except TimeoutError:
-        return json.dumps(error_result(uuid.uuid4().hex, PipelineError(
+        result = error_result(uuid.uuid4().hex, PipelineError(
             "REQUEST_TIMEOUT", stage, "Request exceeded its total deadline.",
-            retryable=True)), ensure_ascii=False)
+            retryable=True))
+        if kwargs.get("analysis_id"):
+            result["analysis_id"] = kwargs["analysis_id"]
+        return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -201,16 +206,18 @@ async def analyze_paper(
     query: str = "", question: str = "", language: str = "en",
     include_images: bool = False, pdf_url: str | None = None,
     document_id: str | None = None, lang: str = "",
-    offset: int = 0, limit_chars: int | None = None,
+    offset: int = 0, limit_chars: int | None = None, analysis_id: str | None = None,
 ) -> str:
     """Analyze a question using parsed paper text; this invokes a paid model.
 
     Input selection is identical to get_paper_text; offset/limit_chars can select a relevant passage. Returned analysis includes
     actual reading coverage and quoted evidence locations. Retained image
     references are not visually analyzed. language must be en or zh.
+    Reuse analysis_id with identical inputs to retrieve/wait for the same paid task;
+    a new analysis_id explicitly creates a new analysis. Previous failures are retained.
     """
     return await _run_pipeline(
         "analyze_paper", query=query, question=question, language=language,
         include_images=include_images, pdf_url=pdf_url, document_id=document_id, lang=lang,
-        offset=offset, limit_chars=limit_chars,
+        offset=offset, limit_chars=limit_chars, analysis_id=analysis_id,
     )

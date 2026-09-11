@@ -162,6 +162,55 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error_code"], "INVALID_RANGE")
         self.arxiv.resolve.assert_not_awaited()
 
+class AnalysisIdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = OrchestratorTests.asyncSetUp
+    asyncTearDown = OrchestratorTests.asyncTearDown
+    async def test_completed_and_inflight_analysis_only_generate_once(self):
+        started, finish = asyncio.Event(), asyncio.Event()
+        async def extract(*args, **kwargs):
+            started.set()
+            await finish.wait()
+            from scholar_analysis.cost import cost_scope
+            with cost_scope() as ledger:
+                record = ledger.start("deepseek-flash")
+                ledger.finish(record, status="success", data={"usage":{"prompt_tokens":10,"prompt_cache_hit_tokens":0,"completion_tokens":2}})
+            return {"answer": "Answer", "evidence": []}
+        self.orch._post_processor.extract = AsyncMock(side_effect=extract)
+        a = asyncio.create_task(self.orch.analyze_paper("2401.00001", "How?", analysis_id="test_same"))
+        await started.wait()
+        b = asyncio.create_task(self.orch.analyze_paper("2401.00001", "How?", analysis_id="test_same"))
+        finish.set()
+        first, second = await asyncio.gather(a,b)
+        third = await self.orch.analyze_paper("2401.00001", "How?", analysis_id="test_same")
+        self.assertEqual(first["status"], "success")
+        self.assertTrue(third["analysis_reused"])
+        self.assertEqual(self.orch._post_processor.extract.await_count, 1)
+        self.assertEqual(third["cost"]["model_calls"], 0)
+        self.assertEqual(first["cost"]["model_calls"]+second["cost"]["model_calls"], 1)
+        self.assertEqual(third["original_cost"]["model_calls"], 1)
+        self.assertEqual(third["request_id"], first["request_id"])
+    async def test_analysis_id_conflict_is_not_new_call(self):
+        self.orch._post_processor.extract = AsyncMock(return_value={"answer":"A"})
+        await self.orch.analyze_paper("2401.00001", "How?", analysis_id="conflict")
+        other = await self.orch.analyze_paper("2401.00001", "Why?", analysis_id="conflict")
+        self.assertEqual(other["error_code"], "ANALYSIS_ID_CONFLICT")
+        self.assertEqual(self.orch._post_processor.extract.await_count, 1)
+    async def test_failed_task_retained_without_reissue(self):
+        self.orch._post_processor.extract = AsyncMock(side_effect=PipelineError("LLM_OUTCOME_UNKNOWN","analysis","unknown"))
+        first = await self.orch.analyze_paper("2401.00001", "How?", analysis_id="unknown")
+        second = await self.orch.analyze_paper("2401.00001", "How?", analysis_id="unknown")
+        self.assertEqual(second["error_code"], "LLM_OUTCOME_UNKNOWN")
+        self.assertEqual(self.orch._post_processor.extract.await_count, 1)
+    async def test_interrupted_saved_task_is_not_regenerated(self):
+        args = dict(query="2401.00001",question="How?",language="en",include_images=False,
+                    pdf_url=None,document_id=None,lang="",offset=0,limit_chars=None)
+        await self.orch._analysis_cache.put("interrupted", {"input":args,"state":"running",
+             "result":{"status":"error","error_code":"ANALYSIS_OUTCOME_UNRESOLVED","original_cost":None}})
+        self.orch._post_processor.extract = AsyncMock()
+        result = await self.orch.analyze_paper("2401.00001","How?",analysis_id="interrupted")
+        self.assertEqual(result["error_code"], "ANALYSIS_OUTCOME_UNRESOLVED")
+        self.orch._post_processor.extract.assert_not_awaited()
+
 class LocationTests(unittest.TestCase):
     def test_pages_reconstruct_text_and_keep_table_formula(self):
         text = "# Methods\n| ours | 40.44 |\n\n$$a+b=c$$\n"

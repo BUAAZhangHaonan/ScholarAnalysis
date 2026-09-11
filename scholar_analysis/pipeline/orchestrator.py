@@ -12,11 +12,12 @@ import httpx
 from scholar_analysis.clients.arxiv_mirror import ArxivMirrorClient, ArxivMirrorError
 from scholar_analysis.clients.mineru import MinerUClient, MinerUError, extract_markdown
 from scholar_analysis.config import get_settings
-from scholar_analysis.cost import costed
+from scholar_analysis.cost import costed, cost_scope
 from scholar_analysis.llm.post_processor import PostProcessor
 from scholar_analysis.pipeline.errors import PipelineError, error_result
 from scholar_analysis.pipeline.identifiers import normalize
 from scholar_analysis.pipeline.parse_cache import ParseCache
+from scholar_analysis.pipeline.analysis_cache import AnalysisCache
 from scholar_analysis.pipeline.request_context import RequestTracker
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,13 @@ class Orchestrator:
         self._parse_cache = ParseCache(self._settings.parse_cache_dir, self._settings.parse_cache_max_bytes)
         self._inflight: dict[tuple, asyncio.Task] = {}
         self._parse_locks = WeakValueDictionary()
+        self._analysis_tasks = {}
+        self._analysis_cache = AnalysisCache(Path(self._settings.parse_cache_dir)/"analyses", self._settings.parse_cache_max_bytes)
 
     async def aclose(self):
+        for _, task in list(self._analysis_tasks.values()):
+            task.cancel()
+        await asyncio.gather(*(task for _, task in self._analysis_tasks.values()), return_exceptions=True)
         for task in list(self._inflight.values()):
             task.cancel()
         await asyncio.gather(*self._inflight.values(), return_exceptions=True)
@@ -168,6 +174,51 @@ class Orchestrator:
 
     @costed
     async def analyze_paper(self, query, question, language="en", include_images=False,
+                            *, pdf_url=None, document_id=None, lang="", offset=0,
+                            limit_chars=None, analysis_id=None):
+        key = analysis_id or "analysis_"+uuid.uuid4().hex
+        args = dict(query=query, question=question, language=language, include_images=include_images,
+                    pdf_url=pdf_url, document_id=document_id, lang=lang, offset=offset, limit_chars=limit_chars)
+        try:
+            saved = await self._analysis_cache.get(key)
+            active = self._analysis_tasks.get(key)
+            if saved is not None:
+                if saved["input"] != args:
+                    raise PipelineError("ANALYSIS_ID_CONFLICT", "input", "analysis_id is already bound to different inputs.")
+                if active is None:
+                    return {**saved["result"], "analysis_reused": True, "cache_hit": True}
+            reused = active is not None
+            if active is not None and active[0] != args:
+                raise PipelineError("ANALYSIS_ID_CONFLICT", "input", "analysis_id is already bound to different inputs.")
+            if active is None:
+                task = asyncio.create_task(self._saved_analysis(key, args))
+                self._analysis_tasks[key] = (args, task)
+                def done(t):
+                    self._analysis_tasks.pop(key, None)
+                    if not t.cancelled():
+                        t.exception()
+                task.add_done_callback(done)
+            else:
+                task = active[1]
+            result = await asyncio.shield(task)
+            return {**result, "analysis_reused": reused, **({"cache_hit": True} if reused else {})}
+        except PipelineError as exc:
+            return {**error_result(uuid.uuid4().hex, exc), "analysis_id": key}
+
+    async def _saved_analysis(self, key, args):
+        with cost_scope() as ledger:
+            pending = {**error_result(key, PipelineError(
+                "ANALYSIS_OUTCOME_UNRESOLVED", "analysis",
+                "The prior task did not record a final result. It will not be regenerated automatically; inspect its outcome before using a new analysis_id.")),
+                "analysis_id": key, "original_cost": None}
+            await self._analysis_cache.put(key, {"input": args, "result": pending, "state": "running"})
+            result = await self._analyze_once(**args)
+            result["analysis_id"] = key
+            result["original_cost"] = ledger.report()
+            await self._analysis_cache.put(key, {"input": args, "result": result, "state": "finished"})
+            return result
+
+    async def _analyze_once(self, query, question, language="en", include_images=False,
                             *, pdf_url=None, document_id=None, lang="", offset=0, limit_chars=None):
         rid, start = uuid.uuid4().hex, time.monotonic()
         try:
