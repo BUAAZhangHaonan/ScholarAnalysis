@@ -1,115 +1,123 @@
 # ScholarAnalysis
 
-arXiv paper download, Markdown parsing, and focused LLM analysis MCP server.
+MCP paper reading and optional focused analysis. arXiv uses the existing mirror;
+public PDF and DOI/publisher pages use their declared PDF links and the existing MinerU parser.
 
-## Features
+## Install and run
 
-- **Paper to Markdown** -- Download arXiv PDFs and convert to clean Markdown via [MinerU](https://github.com/opendatalab/MinerU). Optionally preserve image references for multimodal models.
-- **Focused LLM analysis** -- Instead of dumping a full paper into your agent's context, extract only the parts relevant to a specific question using DeepSeek / GLM / Qwen backends with automatic failover.
-
-## Prerequisites
-
-| Dependency | Purpose |
-|---|---|
-| [ArxivMirror](https://github.com/BUAAZhangHaonan/ArxivMirror) | arXiv PDF mirror and download service |
-| [MinerU](https://github.com/opendatalab/MinerU) | PDF to Markdown parsing service |
-| Python 3.11+ | Runtime |
-
-## Quick Start
+Python 3.11 or later is required.
 
 ```bash
-git clone https://github.com/BUAAZhangHaonan/ScholarAnalysis.git
-cd ScholarAnalysis
-python -m venv venv && source venv/bin/activate
-pip install -e .
+python -m venv venv
+venv/bin/pip install -e .
+cp .env.example .env
+# Set service credentials and upstream endpoints locally; never commit .env.
+venv/bin/python -m scholar_analysis.main
 ```
 
-Create a `.env` file (see `.env.example` for all options):
+The SSE endpoint is `/sse`. Clients authenticate with an Authorization Bearer
+header. A production systemd template is in `scripts/scholar-analysis.service`;
+review its paths and environment before installing it.
 
-```env
-SCHOLAR_ANALYSIS_ACCESS_TOKEN=your-secret-token
-SCHOLAR_ANALYSIS_TRANSPORT=sse
-SCHOLAR_ANALYSIS_PORT=8005
+## Read a document
 
-SCHOLAR_ANALYSIS_DEEPSEEK_API_KEY=sk-xxx
-SCHOLAR_ANALYSIS_ARXIV_MIRROR_BASE_URL=http://127.0.0.1:8900/api/v1
-SCHOLAR_ANALYSIS_MINERU_BASE_URL=http://localhost:8888
+`get_paper_text` accepts exactly one source: `query` (arXiv ID/URL or DOI),
+`pdf_url` (direct PDF or a page declaring citation_pdf_url), or a returned
+`document_id` for cache-only reading. It does not search paper titles or bypass paywalls.
+
+```json
+{"pdf_url":"https://aclanthology.org/2024.findings-acl.212.pdf","limit_chars":1000}
 ```
 
-Run the server:
+Continue with the returned document ID and next offset:
+
+```json
+{"document_id":"doc_from_previous_response","offset":1000,"limit_chars":64000}
+```
+
+`find_text` performs literal search from offset and returns matching character/line
+locations with surrounding text. `lang` is an optional parser hint; reuse it on
+subsequent reads. `refresh=true` with the original source explicitly reparses.
+Requests for the same source share in-flight work. Valid cached versions are
+readable without the mirror. An unversioned arXiv query may return its cached
+version; use refresh to request an updated snapshot.
+
+The response preserves Markdown, source original/final URLs, document revision,
+range, total_chars, next_offset, eof, section headings and line positions.
+Positions refer to Unicode characters in the requested text mode, not PDF pages.
+`eof` only means the returned slice reaches the end; full coverage also requires
+range.start=0. Parse coverage is not a certification of PDF completeness.
+Tables and formula text supplied by MinerU are retained. Image references can be
+preserved with include_images; no image pixels are fetched or interpreted.
+
+## Optional paid analysis
+
+`analyze_paper` adds question, language (en/zh), optional offset/limit_chars and
+analysis_id. An explicit range can select a relevant method or appendix.
+If the model context cannot hold all input, only complete Markdown blocks are
+supplied and the actual coverage is disclosed. Unread text cannot support a
+claim that the full paper lacks a result.
+
+```json
+{"document_id":"doc_from_previous_response","question":"Explain the method and its assumptions in one paragraph.","language":"en","analysis_id":"my-review-001"}
+```
+
+Reuse analysis_id with identical inputs to wait for or retrieve the same task.
+Results, failures and unresolved interrupted tasks are retained; a new ID
+explicitly authorizes a new task. Cached replies expose original_cost separately
+and incur zero new model cost. Analysis receipts are not silently evicted to
+permit duplicate generation; when receipt storage is full, new tasks fail before
+a model call. Clearing that storage also clears the idempotency history.
+
+The response includes the final answer, exact evidence quotes and matched source
+positions. Matching proves attribution only, not scientific entailment.
+Reasoning-only or length-stopped responses are errors. Text analysis does not
+claim to inspect images. Unknown sent outcomes are not automatically retried;
+bounded HTTP 429 retry stays on the same configured model.
+
+Default: `deepseek-flash`. Select `deepseek-v4-pro` explicitly through
+SCHOLAR_ANALYSIS_DEEPSEEK_MODEL if wanted. There is no automatic provider/model
+fallback. Thinking false/true is sent explicitly as disabled/enabled.
+Account concurrency capacities are not worker defaults; size model and PDF
+concurrency from measured service capacity.
+
+## Errors, usage and storage
+
+All tool successes, operation errors and cache reads include `mcp.cost.v1`:
+CNY provider API usage estimates, per-attempt records, unknown usage and price
+ranges. These are not invoices and exclude parsing/hosting/GPU costs. Tariff
+source/version is included; peak crossings or missing cache breakdown keep a
+range. Missing usage is never counted as zero.
+
+Errors include error_code, stage, retryable and retry_after_seconds. For example,
+mirror_download HTTP 502 is a mirror failure, not a MinerU error. Both queue wait
+and total request duration are bounded. Raw upstream diagnostics remain in the
+server log.
+
+Parse cache files are validated and written atomically. The URL catalog contains
+source identities, not hashes. Analysis records retain question, result and cost;
+restrict access to the configured cache directory. Packaged YAML prompts work
+outside the repository; an explicit prompts_dir may override them.
+
+## Validation
+
+Offline, no network or model calls:
 
 ```bash
-python -m scholar_analysis.main
+venv/bin/python -m unittest discover -s tests -v
+venv/bin/python scripts/stress_test.py
 ```
 
-## MCP Tools
+Explicit live PDF and cached-concurrency acceptance:
 
-### get_paper_text
-
-Download and parse a paper to Markdown.
-
-```json
-{
-  "query": "2402.01306",
-  "include_images": false
-}
+```bash
+venv/bin/python scripts/stress_test.py --live --url http://127.0.0.1:8005 \
+  --pdf-url https://aclanthology.org/2024.findings-acl.212.pdf --requests 4 --concurrency 4
 ```
 
-Returns JSON with paper metadata and full Markdown text.
-
-### analyze_paper
-
-Download, parse, then use LLM to extract content relevant to your question.
-
-```json
-{
-  "query": "2402.01306",
-  "question": "What is the main contribution of this paper?",
-  "language": "en",
-  "include_images": false
-}
-```
-
-Returns JSON with a focused analysis result instead of the entire paper.
-
-**Parameters:**
-
-- `query` -- arXiv ID (e.g. `2402.01306`) or arXiv URL. Title search is not supported.
-- `question` -- The analysis question or focus area.
-- `language` -- `"en"` (default) or `"zh"`.
-- `include_images` -- `true` to preserve image references for multimodal models.
-
-## Configuration
-
-All settings use the `SCHOLAR_ANALYSIS_` env prefix and can be placed in a `.env` file. See `.env.example` for the full list.
-
-Key groups:
-
-- **Server** -- `HOST`, `PORT`, `TRANSPORT` (`sse` or `stdio`), `ACCESS_TOKEN`
-- **Backends** -- `ARXIV_MIRROR_BASE_URL`, `MINERU_BASE_URL`
-- **LLM** -- `DEEPSEEK_*` (primary), `BIGMODEL_*` (GLM fallback), `QWEN_*` (local fallback)
-
-## MCP Client Setup
-
-Add to your MCP client configuration:
-
-```json
-{
-  "mcpServers": {
-    "scholar-analysis": {
-      "url": "http://localhost:8005/sse",
-      "headers": {
-        "Authorization": "Bearer your-secret-token"
-      }
-    }
-  }
-}
-```
-
-## Related Projects
-
-- [ScholarTrace](https://github.com/BUAAZhangHaonan/ScholarTrace) -- Multi-source academic literature search and tracking.
-
-## License
-
-MIT
+The CLI reads SCHOLAR_ANALYSIS_ACCESS_TOKEN from the environment, never prints it.
+Live model calls additionally require --analysis --allow-paid-analysis.
+By default analysis requests share one ID to test idempotency; add
+--distinct-analysis-ids for separately authorized parallel generations.
+Reports include semantic checks, p50/p95 latency, success/degraded/failure counts,
+unique model attempts and cost bounds. See [the recorded validation](docs/VALIDATION_20260912.md).

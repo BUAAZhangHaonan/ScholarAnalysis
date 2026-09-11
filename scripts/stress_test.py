@@ -1,275 +1,166 @@
-"""End-to-end stress test for ScholarAnalysis MCP server (SSE transport)."""
-
+#!/usr/bin/env python3
+"""Bounded offline or explicit live MCP acceptance; never prints credentials."""
 from __future__ import annotations
-
+import argparse
 import asyncio
+from collections import Counter
+from decimal import Decimal
 import json
+import os
+from pathlib import Path
+import statistics
+import subprocess
 import sys
 import time
+import uuid
 
-import httpx
+def percentile(values, fraction):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    return ordered[min(len(ordered)-1, max(0, int((len(ordered)-1)*fraction+0.5)))]
 
-BASE_URL = "http://127.0.0.1:8005"
-TOKEN = "g203-mcp"
-AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
-JSON_HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
-
-
-class SSEClient:
-    """Manages a single SSE session with FastMCP."""
-
-    def __init__(self, client: httpx.AsyncClient, base_url: str):
-        self._client = client
-        self._base_url = base_url
-        self._sse_response: httpx.Response | None = None
-        self._raw_iter = None
-        self._endpoint: str | None = None
-        self._buffer = ""
-
-    async def connect(self) -> None:
-        self._sse_response = await self._client.send(
-            self._client.build_request(
-                "GET",
-                f"{self._base_url}/sse",
-                headers={**AUTH_HEADERS, "Accept": "text/event-stream"},
-            ),
-            stream=True,
-        )
-        assert self._sse_response.status_code == 200, \
-            f"SSE handshake failed: {self._sse_response.status_code}"
-        self._raw_iter = self._sse_response.aiter_bytes()
-        # Read the endpoint event
-        event_type, data = await self._read_event()
-        assert event_type == "endpoint", f"Expected endpoint event, got {event_type}: {data}"
-        self._endpoint = data
-        print(f"  SSE session: {self._endpoint}")
-
-    async def _read_event(self) -> tuple[str, str]:
-        """Read one SSE event from the stream, properly handling chunk boundaries."""
-        event_type = ""
-        data = ""
-        async for chunk in self._raw_iter:
-            self._buffer += chunk.decode("utf-8", errors="replace")
-            while "\n" in self._buffer:
-                line, self._buffer = self._buffer.split("\n", 1)
-                line = line.strip()
-                if line.startswith("event:"):
-                    event_type = line.removeprefix("event:").strip()
-                elif line.startswith("data:"):
-                    data = line.removeprefix("data:").strip()
-                elif line == "":
-                    if event_type or data:
-                        return event_type, data
-        raise RuntimeError("SSE stream ended unexpectedly")
-
-    async def initialize(self) -> None:
-        """Perform MCP initialize handshake (required before any tool calls)."""
-        assert self._endpoint, "Not connected"
-        url = f"{self._base_url}{self._endpoint}"
-
-        # Step 1: send initialize request
-        init_payload = {
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "stress-test", "version": "1.0"},
-            },
-        }
-        r = await self._client.post(url, headers=JSON_HEADERS, json=init_payload)
-        assert r.status_code == 202, f"initialize POST returned {r.status_code}: {r.text}"
-
-        # Read initialize response from SSE stream
-        while True:
-            event_type, data = await self._read_event()
-            if event_type == "message":
-                msg = json.loads(data)
-                if "error" in msg:
-                    raise RuntimeError(f"initialize failed: {msg['error']}")
-                break
-            print(f"  SSE event (init, skipped): {event_type}: {data[:100]}")
-
-        # Step 2: send notifications/initialized (no id = notification)
-        notif_payload = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        }
-        r = await self._client.post(url, headers=JSON_HEADERS, json=notif_payload)
-        assert r.status_code == 202, f"notifications/initialized POST returned {r.status_code}: {r.text}"
-
-    async def call_tool(self, payload: dict) -> dict:
-        """Send a tool call and read the response from the SSE stream."""
-        assert self._endpoint, "Not connected"
-        url = f"{self._base_url}{self._endpoint}"
-        r = await self._client.post(url, headers=JSON_HEADERS, json=payload)
-        assert r.status_code == 202, f"POST returned {r.status_code}: {r.text}"
-
-        # Read response events until we get the tool result
-        while True:
-            event_type, data = await self._read_event()
-            if event_type == "message":
-                msg = json.loads(data)
-                return msg
-            print(f"  SSE event (skipped): {event_type}: {data[:100]}")
-
-    async def close(self) -> None:
-        if self._sse_response:
-            await self._sse_response.aclose()
-
-
-async def _run_tool_test(
-    name: str,
-    tool_name: str,
-    arguments: dict,
-    timeout: float = 120.0,
-) -> dict:
-    """Run a single tool test via SSE and return the parsed result dict."""
-    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-        sse = SSEClient(client, BASE_URL)
-        await sse.connect()
-        await sse.initialize()
-        try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
-            }
-            response = await sse.call_tool(payload)
-            # Extract the text content from the JSON-RPC result
-            result_text = (
-                response.get("result", {})
-                .get("content", [{}])[0]
-                .get("text", "{}")
-            )
-            return json.loads(result_text)
-        finally:
-            await sse.close()
-
-
-async def test_health():
-    """Test 1: Server health check via SSE handshake."""
-    print("\n=== Test 1: Health Check (SSE handshake) ===")
-    async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
-        sse = SSEClient(client, BASE_URL)
-        await sse.connect()
-        await sse.initialize()
-        assert sse._endpoint and "session_id" in sse._endpoint
-        await sse.close()
-    print("  PASS")
-
-
-async def test_get_paper_text():
-    """Test 2: Single paper text retrieval."""
-    print("\n=== Test 2: get_paper_text ===")
-    result = await _run_tool_test(
-        "get_paper_text",
-        "get_paper_text",
-        {"query": "2402.01306", "include_images": False},
-        timeout=120.0,
-    )
-    status = result.get("status", "unknown")
-    md_len = len(result.get("markdown", ""))
-    timing = result.get("timing", {})
-    print(f"  Status: {status}, Markdown length: {md_len}")
-    print(f"  Timing: {timing}")
-    assert status == "success", f"Failed: {result.get('error', 'unknown')}"
-    print("  PASS")
-
-
-async def test_analyze_paper():
-    """Test 3: Single paper LLM analysis."""
-    print("\n=== Test 3: analyze_paper ===")
-    result = await _run_tool_test(
-        "analyze_paper",
-        "analyze_paper",
-        {
-            "query": "2402.01306",
-            "question": "What alignment methods does this paper propose?",
-            "language": "en",
-        },
-        timeout=300.0,
-    )
-    status = result.get("status", "unknown")
-    analysis = result.get("analysis", {})
-    print(f"  Status: {status}")
-    print(f"  Model: {analysis.get('model_used', 'N/A')}")
-    print(f"  Answer length: {len(analysis.get('answer', ''))}")
-    print(f"  Timing: {result.get('timing', {})}")
-    assert status == "success", f"Failed: {result.get('error', 'unknown')}"
-    print("  PASS")
-
-
-async def test_concurrent():
-    """Test 4: Concurrent requests (3 users, 1 paper each)."""
-    print("\n=== Test 4: Concurrent requests ===")
-    queries = ["2402.01306", "2312.11805", "2401.04088"]
-    tasks = [
-        _run_tool_test(
-            f"concurrent_{q}",
-            "get_paper_text",
-            {"query": q},
-            timeout=120.0,
-        )
-        for q in queries
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    ok = sum(1 for r in results if isinstance(r, dict) and r.get("status") == "success")
-    print(f"  {ok}/{len(queries)} succeeded")
-    for i, r in enumerate(results):
-        if isinstance(r, Exception):
-            print(f"  Query {queries[i]}: FAILED - {r}")
+def check_cost(value):
+    cost = value.get("cost")
+    if not isinstance(cost, dict) or cost.get("schema_version") != "mcp.cost.v1":
+        raise AssertionError("Missing mcp.cost.v1")
+    if cost["model_calls"] == 0 and cost["total_cny"] is not None:
+        assert Decimal(cost["total_cny"]) == 0
+    if cost["complete"]:
+        assert cost["lower_cny"] is not None and cost["upper_cny"] is not None
+        if Decimal(cost["lower_cny"]) == Decimal(cost["upper_cny"]):
+            assert cost["total_cny"] is not None
         else:
-            print(f"  Query {queries[i]}: {r.get('status')}")
-    assert ok == len(queries), f"Only {ok}/{len(queries)} succeeded"
-    print("  PASS")
+            assert cost["total_cny"] is None
+    else:
+        assert cost["total_cny"] is None
 
+async def live(args):
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+    token = os.environ.get("SCHOLAR_ANALYSIS_ACCESS_TOKEN", "")
+    headers = {"Authorization": "Bearer "+token} if token else {}
+    async def call(tool, arguments):
+        async with sse_client(args.url.rstrip("/")+"/sse", headers=headers,
+                              timeout=30, sse_read_timeout=args.timeout) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool, arguments)
+                if result.isError:
+                    raise RuntimeError("MCP transport/tool wrapper returned an error")
+                text = next((b.text for b in result.content if b.type == "text"), "")
+                value = json.loads(text)
+                check_cost(value)
+                return value
 
-async def test_invalid_id():
-    """Test 5: Invalid arXiv ID error handling."""
-    print("\n=== Test 5: Invalid arXiv ID ===")
-    result = await _run_tool_test(
-        "invalid_id",
-        "get_paper_text",
-        {"query": "INVALID_ID_12345"},
-        timeout=60.0,
-    )
-    print(f"  Status: {result.get('status')}")
-    print(f"  Error: {result.get('error', 'N/A')[:200]}")
-    assert result.get("status") in ("error", "success"), f"Unexpected: {result}"
-    print("  PASS (error handled gracefully)")
+    source = {"pdf_url": args.pdf_url} if args.pdf_url else {"query": args.query}
+    warm_start = time.monotonic()
+    first = await call("get_paper_text", {**source, "limit_chars": 1000})
+    warmup = {"seconds": round(time.monotonic()-warm_start, 3), "status": first.get("status"),
+              "error_code": first.get("error_code"), "stage": first.get("stage"),
+              "total_chars": first.get("total_chars"), "source": first.get("source"), "cost": first["cost"]}
+    if first.get("status") != "success":
+        return {"mode":"live", "warmup":warmup, "passed":False, "requests":[]}
+    assert first["markdown"] and first["source"].get("final_url")
+    assert first["range"]["start"] == 0
+    assert first["range"]["end"] == len(first["markdown"])
+    document = first["document_id"]
+    analysis_key = "stress_"+uuid.uuid4().hex
+    gate = asyncio.Semaphore(args.concurrency)
+    costs = []
+    async def one(index):
+        async with gate:
+            started = time.monotonic()
+            try:
+                if args.analysis:
+                    values = {"document_id": document, "question":args.question, "language":args.language,
+                              "analysis_id":analysis_key+("_"+str(index) if args.distinct_analysis_ids else "")}
+                    tool = "analyze_paper"
+                else:
+                    values = {"document_id":document, "offset":min(1000, first["total_chars"]), "limit_chars":1000}
+                    tool = "get_paper_text"
+                result = await call(tool, values)
+                costs.append(result["cost"])
+                status = result.get("status")
+                if status == "success":
+                    if args.analysis:
+                        assert result["analysis"]["answer"].strip()
+                        assert result["analysis"]["finish_reason"] == "stop"
+                        assert "coverage" in result["analysis"]
+                        assert "original_cost" in result
+                    else:
+                        assert result["cache_hit"]
+                        assert result["document_revision"] == first["document_revision"]
+                        assert result["range"]["start"] == values["offset"]
+                        assert result["cost"]["model_calls"] == 0
+                return {"index": index, "status":status, "error_code":result.get("error_code"),
+                        "stage":result.get("stage"), "request_id":result.get("request_id"),
+                        "analysis_id":result.get("analysis_id"), "analysis_reused":result.get("analysis_reused"),
+                        "cache_hit":result.get("cache_hit"), "seconds":round(time.monotonic()-started, 3),
+                        "answer_chars":len(result.get("analysis",{}).get("answer","")),
+                        "evidence_count":len(result.get("analysis",{}).get("evidence",[])),
+                        "cost":result["cost"]}
+            except Exception as exc:
+                return {"index":index, "status":"error", "error_code":type(exc).__name__,
+                        "seconds":round(time.monotonic()-started, 3)}
+    results = await asyncio.gather(*(one(i) for i in range(args.requests)))
+    # Sum actual incremental attempts once, including unknown/failed requests.
+    attempts = {}
+    for cost in costs:
+        for attempt in cost["attempts"]:
+            key = (attempt.get("request_id"), attempt["started_at"], attempt["model_requested"])
+            attempts[key] = attempt
+    low = sum((Decimal(a["lower_cny"] or "0") for a in attempts.values()), Decimal(0))
+    high = None if any(a["upper_cny"] is None for a in attempts.values()) else sum((Decimal(a["upper_cny"]) for a in attempts.values()), Decimal(0))
+    counts = Counter(r["status"] for r in results)
+    elapsed = [r["seconds"] for r in results]
+    passed = counts["success"] == args.requests
+    if args.analysis and not args.distinct_analysis_ids and passed:
+        passed = len({r["request_id"] for r in results}) == 1
+    return {"mode":"live", "warmup":warmup, "passed":passed, "requests":results,
+            "summary":{"requests":len(results), "success":counts["success"],
+                       "degraded":counts["degraded"]+counts["partial"], "failed":counts["error"],
+                       "p50_seconds":round(statistics.median(elapsed), 3), "p95_seconds":percentile(elapsed,.95),
+                       "provider_model_calls":len(attempts), "provider_cost_lower_cny":str(low),
+                       "provider_cost_upper_cny":str(high) if high is not None else None,
+                       "unknown_calls":sum(a["upper_cny"] is None for a in attempts.values())}}
 
-
-async def main():
-    print("ScholarAnalysis MCP Stress Test (SSE transport)")
-    print("=" * 50)
-    t0 = time.monotonic()
-
-    tests = [
-        ("Health Check", test_health),
-        ("get_paper_text", test_get_paper_text),
-        ("analyze_paper", test_analyze_paper),
-        ("Concurrent Requests", test_concurrent),
-        ("Invalid ID", test_invalid_id),
-    ]
-
-    passed = 0
-    failed = 0
-    for name, test_fn in tests:
-        try:
-            await test_fn()
-            passed += 1
-        except Exception as e:
-            print(f"  FAILED: {e}")
-            failed += 1
-
-    elapsed = time.monotonic() - t0
-    print(f"\n{'=' * 50}")
-    print(f"Results: {passed} passed, {failed} failed in {elapsed:.1f}s")
-    sys.exit(1 if failed else 0)
-
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--url", help="MCP server base URL, without /sse")
+    parser.add_argument("--query", default="2402.01306")
+    parser.add_argument("--pdf-url")
+    parser.add_argument("--requests", type=int, default=4)
+    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--analysis", action="store_true")
+    parser.add_argument("--allow-paid-analysis", action="store_true")
+    parser.add_argument("--distinct-analysis-ids", action="store_true")
+    parser.add_argument("--question", default="Explain one central method in under 100 words, with one exact supporting quote.")
+    parser.add_argument("--language", choices=("en","zh"), default="en")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    if not 1 <= args.concurrency <= 64 or not 1 <= args.requests <= 1000:
+        parser.error("concurrency must be 1..64 and requests 1..1000; do not use account capacity as worker count")
+    if args.live:
+        if not args.url:
+            parser.error("--live requires --url")
+        if args.analysis and not args.allow_paid_analysis:
+            parser.error("Live analysis requires explicit --allow-paid-analysis")
+        report = asyncio.run(live(args))
+    else:
+        completed = subprocess.run([sys.executable,"-m","unittest","discover","-s","tests","-q"],
+                                   cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
+        report = {"mode":"offline", "passed":completed.returncode == 0,
+                  "provider_model_calls":0, "provider_cost_cny":"0.00000000",
+                  "test_output":completed.stdout+completed.stderr}
+    data = json.dumps(report, ensure_ascii=False, indent=2)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(data+"\n", encoding="utf-8")
+    print(data)
+    return 0 if report["passed"] else 1
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(main())

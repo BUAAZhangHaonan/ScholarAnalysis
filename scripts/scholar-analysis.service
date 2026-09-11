@@ -28,7 +28,6 @@ RestrictSUIDSGID=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
-ReadWritePaths=/home/g203/zhanghaonan/ScholarAnalysis/prompts
 UMask=0077
 
 [Install]
