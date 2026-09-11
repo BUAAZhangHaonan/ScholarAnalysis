@@ -35,13 +35,26 @@ class CostTests(unittest.TestCase):
         cost = self.item({"prompt_tokens":1000,"completion_tokens":100}).report()
         self.assertEqual(cost["lower_cny"], "0.00042000")
         self.assertEqual(cost["upper_cny"], "0.00140000")
-        self.assertFalse(cost["complete"])
+        self.assertTrue(cost["complete"])
+        self.assertIsNone(cost["total_cny"])
     def test_crossing_peak_boundary_preserves_range(self):
         ledger = self.item({"prompt_tokens":1000,"prompt_cache_hit_tokens":0,"completion_tokens":100},
                            "2026-09-14T08:59:00+08:00", "2026-09-14T09:01:00+08:00")
         cost = ledger.report()
         self.assertEqual(cost["lower_cny"], "0.00140000")
         self.assertEqual(cost["upper_cny"], "0.00280000")
+        self.assertTrue(cost["complete"])
+        self.assertIsNone(cost["total_cny"])
+    def test_unverified_legacy_alias_is_not_new_flash_price(self):
+        ledger = CostLedger()
+        item = ledger.start("deepseek-v4-flash")
+        ledger.finish(item, status="success", data={"usage":{"prompt_tokens":1,"completion_tokens":1}})
+        self.assertIsNone(ledger.report()["upper_cny"])
+    def test_cost_bound_rounding_is_outward(self):
+        from decimal import Decimal
+        from scholar_analysis.cost import _decimal
+        self.assertEqual(_decimal(Decimal(".000000001")), "0.00000000")
+        self.assertEqual(_decimal(Decimal(".000000001"), upper=True), "0.00000001")
     def test_no_paid_calls_and_cached_read(self):
         cost = CostLedger().report(reused=True)
         self.assertEqual(cost["total_cny"], "0.00000000")

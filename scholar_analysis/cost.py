@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from functools import wraps
 from zoneinfo import ZoneInfo
 import json
@@ -43,31 +43,35 @@ def tariffs(start, finish):
         day += timedelta(days=1)
     return kinds
 
-def _decimal(value):
-    return format(value.quantize(D("0.00000001")), "f") if value is not None else None
+def _decimal(value, *, upper=False):
+    return format(value.quantize(D("0.00000001"), rounding=ROUND_CEILING if upper else ROUND_FLOOR), "f") if value is not None else None
 
 def usage_fields(raw):
     raw = raw if isinstance(raw, dict) else {}
     def number(value):
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    details = raw.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
     return {
         "input_tokens": number(raw.get("prompt_tokens")),
-        "cache_hit_tokens": number(raw.get("prompt_cache_hit_tokens", (raw.get("prompt_tokens_details") or {}).get("cached_tokens"))),
+        "cache_hit_tokens": number(raw.get("prompt_cache_hit_tokens", details.get("cached_tokens"))),
         "cache_miss_tokens": number(raw.get("prompt_cache_miss_tokens")),
         "output_tokens": number(raw.get("completion_tokens")),
     }
 
 def estimate(attempt):
     model = attempt.get("model_returned") or attempt["model_requested"]
-    if model in ("deepseek-flash", "deepseek-v4-flash"):
+    if model == "deepseek-flash":
         base = (D(".02"), D("1"), D("4"))
-    elif model in ("deepseek-pro", "deepseek-v4-pro"):
+    elif model == "deepseek-v4-pro":
         base = (D(".15"), D("4.5"), D("13.5"))
     else:
         return D(0), None
     usage = attempt["usage"]
     n, hit, miss, out = (usage[k] for k in ("input_tokens", "cache_hit_tokens", "cache_miss_tokens", "output_tokens"))
     if n is None or out is None:
+        return D(0), None
+    if (hit is not None and hit > n) or (miss is not None and miss > n):
         return D(0), None
     if hit is not None and miss is None and hit <= n:
         miss = n-hit
@@ -102,17 +106,17 @@ class CostLedger:
                     request_id=data.get("id"), usage=usage_fields(data.get("usage")),
                     error_code=error_code)
         low, high = estimate(item)
-        item.update(lower_cny=_decimal(low), upper_cny=_decimal(high))
+        item.update(lower_cny=_decimal(low), upper_cny=_decimal(high, upper=True))
 
     def report(self, reused=False):
         items = self.attempts
         lower = sum((D(a["lower_cny"] or "0") for a in items), D(0))
         upper = None if any(a["upper_cny"] is None for a in items) else sum((D(a["upper_cny"]) for a in items), D(0))
-        complete = upper is not None and upper == lower
+        complete = upper is not None
         return {"schema_version": "mcp.cost.v1", "currency": "CNY", "scope": "provider_api_only",
                 "basis": "estimated_usage" if items else "no_paid_calls",
-                "total_cny": _decimal(lower) if complete else None,
-                "lower_cny": _decimal(lower), "upper_cny": _decimal(upper), "complete": complete,
+                "total_cny": _decimal(lower) if complete and upper == lower else None,
+                "lower_cny": _decimal(lower), "upper_cny": _decimal(upper, upper=True), "complete": complete,
                 "model_calls": len(items), "unknown_calls": sum(a["upper_cny"] is None for a in items),
                 "attempts": [dict(a) for a in items], "reused_result": reused,
                 "pricing_source": PRICE_SOURCE, "pricing_version": PRICE_VERSION,
