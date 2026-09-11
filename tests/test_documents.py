@@ -115,6 +115,8 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         result = await self.orch.get_paper_text("2401.00001v2")
         self.assertEqual(result["status"], "success")
         self.arxiv.resolve.assert_not_awaited()
+        self.assertEqual(result["source"]["final_url"], "https://arxiv.org/pdf/2401.00001v2")
+        self.assertEqual(result["cost"]["model_calls"], 0)
     async def test_concurrent_same_document_single_flight(self):
         results = await asyncio.gather(*(self.orch.get_paper_text("2401.00001") for _ in range(10)))
         self.assertTrue(all(r["status"] == "success" for r in results))

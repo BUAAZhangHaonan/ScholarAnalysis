@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     mineru_passwords: str = ""
 
     http_timeout: float = 600.0
+    queue_timeout_seconds: float = 60.0
 
     # Temp files
     temp_dir: str = "/tmp/scholar-analysis"
@@ -53,13 +54,13 @@ class Settings(BaseSettings):
     cleanup_interval_seconds: float = 300.0
 
     # Prompts
-    prompts_dir: str = "prompts"
+    prompts_dir: str = ""
     default_language: str = "en"
 
     # DeepSeek (primary)
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com/v1/chat/completions"
-    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_model: str = "deepseek-flash"
     deepseek_max_concurrent: int = 3
     deepseek_thinking: bool = False
     deepseek_context_tokens: int = 256000

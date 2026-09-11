@@ -10,6 +10,7 @@ import uuid
 from functools import wraps
 
 from scholar_analysis.config import Settings, get_settings
+from scholar_analysis.cost import costed
 from scholar_analysis.security import AccessTokenMiddleware
 
 from mcp.server.fastmcp import FastMCP
@@ -54,6 +55,7 @@ def safe_tool(func):
     """
 
     @wraps(func)
+    @costed
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
@@ -63,6 +65,8 @@ def safe_tool(func):
             return json.dumps(
                 {
                     "status": "error",
+                    "error_code": "INTERNAL_ERROR", "stage": "tool", "retryable": False,
+                    "retry_after_seconds": None,
                     "error": (
                         f"Internal error in {func.__name__} [ref={ref}]. "
                         f"Details are in the server log; contact the administrator."
@@ -142,66 +146,71 @@ def create_mcp_sse_app(settings: Settings | None = None):
 mcp = create_mcp()
 
 
+async def _run_pipeline(method: str, **kwargs) -> str:
+    from scholar_analysis.pipeline.errors import PipelineError, error_result
+    sem = _get_semaphore()
+    settings = get_settings()
+    stage = "queue"
+    try:
+        async with asyncio.timeout(settings.request_max_age_seconds):
+            try:
+                await asyncio.wait_for(sem.acquire(), timeout=settings.queue_timeout_seconds)
+            except TimeoutError:
+                return json.dumps(error_result(uuid.uuid4().hex, PipelineError(
+                    "QUEUE_TIMEOUT", "queue", "Service is busy; retry later.",
+                    retryable=True, retry_after=5)), ensure_ascii=False)
+            try:
+                stage = "pipeline"
+                result = await getattr(_get_orchestrator(), method)(**kwargs)
+                return json.dumps(result, ensure_ascii=False)
+            finally:
+                sem.release()
+    except TimeoutError:
+        return json.dumps(error_result(uuid.uuid4().hex, PipelineError(
+            "REQUEST_TIMEOUT", stage, "Request exceeded its total deadline.",
+            retryable=True)), ensure_ascii=False)
+
+
 @mcp.tool()
 @safe_tool
 async def get_paper_text(
-    query: str,
-    include_images: bool = False,
+    query: str = "", include_images: bool = False, pdf_url: str | None = None,
+    document_id: str | None = None, offset: int = 0, limit_chars: int = 64000,
+    find_text: str | None = None, lang: str = "", refresh: bool = False,
 ) -> str:
-    """获取论文的完整 Markdown 文本。
+    """Read parsed paper Markdown with exact character/line/section locations.
 
-    下载并解析论文 PDF，返回 Markdown 格式文本。
-    设置 include_images=true 可保留图片引用，供多模态模型使用。
-
-    Args:
-        query: arXiv ID (如 2402.01306) 或 arXiv URL。不支持标题搜索。
-        include_images: True 保留图片引用(多模态模型用), False 纯文本(默认)
-
-    Returns:
-        JSON string with paper metadata and markdown text.
+    Supply one arXiv ID/URL or DOI in query, a public paper/PDF pdf_url, OR a
+    previously returned document_id for a cache-only read. Publisher pages need
+    a declared citation_pdf_url. No title search. offset/limit_chars page through
+    the requested text mode; find_text locates literal text at/after offset.
+    include_images retains image references, NOT image pixels or visual analysis.
+    Coverage describes returned parsed text, never certifies PDF completeness.
+    Use refresh with the original source to retry parsing or refresh a snapshot.
     """
-    sem = _get_semaphore()
-    async with sem:
-        orch = _get_orchestrator()
-        result = await orch.get_paper_text(query=query, include_images=include_images)
-        return json.dumps(result, ensure_ascii=False)
+    return await _run_pipeline(
+        "get_paper_text", query=query, include_images=include_images, pdf_url=pdf_url,
+        document_id=document_id, offset=offset, limit_chars=limit_chars,
+        find_text=find_text, lang=lang, refresh=refresh,
+    )
 
 
 @mcp.tool()
 @safe_tool
 async def analyze_paper(
-    query: str,
-    question: str,
-    language: str = "en",
-    include_images: bool = False,
+    query: str = "", question: str = "", language: str = "en",
+    include_images: bool = False, pdf_url: str | None = None,
+    document_id: str | None = None, lang: str = "",
+    offset: int = 0, limit_chars: int | None = None,
 ) -> str:
-    """下载解析论文后，使用 LLM 根据 question 提取相关内容。
+    """Analyze a question using parsed paper text; this invokes a paid model.
 
-    先下载并解析论文为 Markdown，再用 LLM 针对 question
-    提取论文中相关的方法、结论和关键发现。
-    避免将整篇论文塞入 Agent 上下文，只返回聚焦的分析结果。
-
-    Args:
-        query: arXiv ID (如 2402.01306) 或 arXiv URL。不支持标题搜索。
-        question: 用户的分析问题/关注点
-        language: "en" (English) 或 "zh" (中文), 默认 "en"
-        include_images: True 保留图片引用, False 纯文本(默认)
-
-    Returns:
-        JSON string with focused analysis result.
+    Input selection is identical to get_paper_text; offset/limit_chars can select a relevant passage. Returned analysis includes
+    actual reading coverage and quoted evidence locations. Retained image
+    references are not visually analyzed. language must be en or zh.
     """
-    sem = _get_semaphore()
-    async with sem:
-        if language not in ("en", "zh"):
-            logger.info(
-                "analyze_paper: invalid language=%r, falling back to 'en'", language
-            )
-            language = "en"
-        orch = _get_orchestrator()
-        result = await orch.analyze_paper(
-            query=query,
-            question=question,
-            language=language,
-            include_images=include_images,
-        )
-        return json.dumps(result, ensure_ascii=False)
+    return await _run_pipeline(
+        "analyze_paper", query=query, question=question, language=language,
+        include_images=include_images, pdf_url=pdf_url, document_id=document_id, lang=lang,
+        offset=offset, limit_chars=limit_chars,
+    )

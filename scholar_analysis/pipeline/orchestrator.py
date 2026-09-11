@@ -12,6 +12,7 @@ import httpx
 from scholar_analysis.clients.arxiv_mirror import ArxivMirrorClient, ArxivMirrorError
 from scholar_analysis.clients.mineru import MinerUClient, MinerUError, extract_markdown
 from scholar_analysis.config import get_settings
+from scholar_analysis.cost import costed
 from scholar_analysis.llm.post_processor import PostProcessor
 from scholar_analysis.pipeline.errors import PipelineError, error_result
 from scholar_analysis.pipeline.identifiers import normalize
@@ -140,6 +141,7 @@ class Orchestrator:
         finally:
             await self._tracker.remove(ctx.request_id)
 
+    @costed
     async def get_paper_text(self, query="", include_images=False, *, pdf_url=None,
                              document_id=None, offset=0, limit_chars=64000,
                              find_text=None, lang="", refresh=False):
@@ -151,8 +153,9 @@ class Orchestrator:
             markdown = extract_markdown(result, text_only=not include_images)
             body = read_slice(markdown, offset, limit_chars, find_text)
             return {"request_id": rid, "status": "success", "paper": result.get("_paper", {"arxiv_id": document, "versioned_id": document}),
-                    "document_id": document, "document_revision": result.get("_revision"),
-                    "source": result.get("_source", {}), "cache_hit": cache_hit,
+                    "document_id": document, "document_revision": result.get("_revision") or "legacy:"+document,
+                    "source": result.get("_source") or ({"original_url": "https://arxiv.org/abs/"+document,
+                        "final_url": "https://arxiv.org/pdf/"+document, "document_type": "pdf"} if not document.startswith("doc_") else {}), "cache_hit": cache_hit,
                     "mode": "image_references" if include_images else "text_only",
                     "image_capability": "References only; images are not fetched or visually interpreted.",
                     "parse_coverage": "Parser Markdown only; PDF page coverage/completeness is not certified.",
@@ -163,8 +166,9 @@ class Orchestrator:
             logger.exception("Document read failed [request_id=%s]", rid)
             return error_result(rid, PipelineError("INTERNAL_ERROR", "read", "Document read failed; use request_id to inspect the server log."))
 
+    @costed
     async def analyze_paper(self, query, question, language="en", include_images=False,
-                            *, pdf_url=None, document_id=None, lang=""):
+                            *, pdf_url=None, document_id=None, lang="", offset=0, limit_chars=None):
         rid, start = uuid.uuid4().hex, time.monotonic()
         try:
             if not question.strip() or language not in ("en", "zh"):
@@ -172,9 +176,13 @@ class Orchestrator:
             async with asyncio.timeout(self._settings.request_max_age_seconds):
                 result, document, cached = await self._load(query, pdf_url, document_id, lang=lang)
                 markdown = extract_markdown(result, text_only=not include_images)
-                analysis = await self._post_processor.extract(markdown, question, language)
+                if offset < 0 or offset > len(markdown) or (limit_chars is not None and not 1 <= limit_chars <= 64000):
+                    raise PipelineError("INVALID_RANGE", "input", "Select a valid offset and optional limit_chars from 1 to 64000.")
+                excerpt = markdown[offset:offset+limit_chars] if limit_chars is not None else markdown[offset:]
+                analysis = await self._post_processor.extract(excerpt, question, language,
+                                                              source_offset=offset, total_chars=len(markdown))
             return {"request_id": rid, "status": "success", "paper": result.get("_paper", {}),
-                    "document_id": document, "document_revision": result.get("_revision"),
+                    "document_id": document, "document_revision": result.get("_revision") or "legacy:"+document,
                     "source": result.get("_source", {}), "cache_hit": cached,
                     "analysis": {"question": question, **analysis},
                     "image_capability": "Text analysis only; retained image references are not visual evidence.",
