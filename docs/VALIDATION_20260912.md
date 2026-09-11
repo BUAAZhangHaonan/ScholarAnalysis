@@ -102,3 +102,9 @@ characters by default and all remaining 62372 with explicit limit_chars=64000; o
 reading returned 64000. The observed "ablat" miss in 2608.11024v1 returned zero characters,
 including when an explicit 64000 limit was provided. Each read took 0.001–0.003 seconds.
 The running service and ARC run state were not changed during this verification.
+
+After the search-window correction, the coordinator reran the complete offline suite
+with venv/bin/python -m unittest discover -s tests -v: **52 tests passed**.
+The cache-only acceptance above added **0 model requests and 0 CNY**; it neither
+refetched nor reparsed the papers. This correction has not independently restarted
+the production service: deployment remains coordinated at a safe ARC stage boundary.
