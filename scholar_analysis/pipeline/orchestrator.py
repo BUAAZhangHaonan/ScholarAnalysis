@@ -234,7 +234,8 @@ class Orchestrator:
                                                               source_offset=offset, total_chars=len(markdown))
             return {"request_id": rid, "status": "success", "paper": result.get("_paper", {}),
                     "document_id": document, "document_revision": result.get("_revision") or "legacy:"+document,
-                    "source": result.get("_source", {}), "cache_hit": cached,
+                    "source": result.get("_source") or ({"original_url": "https://arxiv.org/abs/"+document,
+                        "final_url": "https://arxiv.org/pdf/"+document, "document_type": "pdf"} if not document.startswith("doc_") else {}), "cache_hit": cached,
                     "analysis": {"question": question, **analysis},
                     "image_capability": "Text analysis only; retained image references are not visual evidence.",
                     "timing": {"total_s": round(time.monotonic()-start, 3)}}

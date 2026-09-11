@@ -19,7 +19,8 @@ def load_prompt(name, language="en", prompts_dir=""):
         raise ValueError("Unsupported prompt name or language")
     base = Path(prompts_dir) if prompts_dir else files("scholar_analysis").joinpath("prompts")
     # Historical default 'prompts' meant the shipped assets, not a mandatory cwd.
-    if str(prompts_dir) == "prompts" and not Path(prompts_dir).exists():
+    if str(prompts_dir) == "prompts" and not any(
+            Path(prompts_dir, f"{name}.{lang}.yaml").is_file() for lang in (language, "en")):
         base = files("scholar_analysis").joinpath("prompts")
     key = (str(base), name, language)
     if key in _loader_cache:

@@ -1,10 +1,4 @@
-"""DeepSeek backend — builds request payloads.
-
-The non-standard `thinking` field is only emitted when explicitly requested
-via the `thinking=True` flag (defaults to False). DeepSeek's official chat
-completions API does not accept this field on most models; only enable it if
-you are targeting a reasoner-class model that documents it.
-"""
+"""DeepSeek payload: thinking mode is always explicit, including disabled."""
 
 from __future__ import annotations
 
@@ -29,6 +23,5 @@ def build_payload(
         "max_tokens": max_tokens,
         "temperature": 0.3,
     }
-    if thinking:
-        payload["thinking"] = {"type": "enabled"}
+    payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
     return payload

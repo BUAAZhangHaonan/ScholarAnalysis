@@ -153,10 +153,17 @@ class PromptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             try:
                 os.chdir(d)
+                from pathlib import Path
+                Path("prompts").mkdir()
                 self.assertIn("{coverage}", load_prompt("extract_focus", "zh").user)
                 self.assertIn("{coverage}", load_prompt("extract_focus", "en", prompts_dir="prompts").user)
             finally:
                 os.chdir(previous)
+    def test_thinking_mode_is_explicit_for_both_values(self):
+        from scholar_analysis.llm.backends.deepseek import build_payload
+        for enabled in (False, True):
+            payload = build_payload(model="deepseek-flash", system_msg="s", user_msg="u", thinking=enabled)
+            self.assertEqual(payload["thinking"]["type"], "enabled" if enabled else "disabled")
     def test_budget_does_not_split_formula_block(self):
         text = "Intro.\n\n$$" + "x"*100 + "$$\n\nEnd."
         short = PromptBudget().truncate_text(text, 30)
