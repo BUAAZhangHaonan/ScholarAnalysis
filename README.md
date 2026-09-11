@@ -123,8 +123,15 @@ venv/bin/python scripts/stress_test.py --live --url http://127.0.0.1:8005 \
 The CLI reads SCHOLAR_ANALYSIS_ACCESS_TOKEN from the shell first, then this
 repository's .env (or --env-file). It never prints credentials. Missing credentials
 fail before connecting; HTTP 401/403 ends the session promptly. --no-auth is only
-for deliberately unauthenticated test endpoints. Live model calls additionally require --analysis --allow-paid-analysis.
+for deliberately unauthenticated test endpoints. Live model calls additionally require --analysis --allow-paid-analysis
+--analysis-run-id sa-20260912-check (choose an explicit stable batch ID).
 By default analysis requests share one ID to test idempotency; add
 --distinct-analysis-ids for separately authorized parallel generations.
+To recover a failed invocation, reuse the same --analysis-run-id and the same
+source, question, language and distinct/shared-ID setting. Do not choose a new ID
+merely because a response was lost: the previous model call may already be paid.
+Before dispatch, IDs are printed to stderr and, when --output is set, appended to
+<output>.requests.jsonl. Failed results retain IDs; missing analysis receipts leave
+cost upper bounds unknown rather than reporting zero or inventing provider calls.
 Reports include semantic checks, p50/p95 latency, success/degraded/failure counts,
 unique model attempts and cost bounds. See [the recorded validation](docs/VALIDATION_20260912.md).

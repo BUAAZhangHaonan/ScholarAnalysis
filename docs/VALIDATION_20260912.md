@@ -50,9 +50,14 @@ venv/bin/python scripts/stress_test.py --live --url http://127.0.0.1:8005 \
   --output /tmp/scholar-analysis-read-live.json
 ```
 
-To repeat paid analysis after authorization, use --analysis --allow-paid-analysis.
+To repeat paid analysis after authorization, add --analysis --allow-paid-analysis
+--analysis-run-id sa-20260912-check to the live command above.
 Shared-ID mode tests one generation; --distinct-analysis-ids tests separate model
-requests. Credentials are read only from the environment and are absent from reports.
+requests. On recovery, reuse the same batch ID, source, question, language and
+shared/distinct-ID setting. The script logs each recoverable ID before dispatch to
+stderr and to <output>.requests.jsonl when --output is provided. A missing analysis
+receipt remains an unknown cost upper bound, not a zero-cost successful call.
+Credentials are read from the shell or configured .env and are absent from reports.
 
 ## Deployment checks still owned by the coordinator
 
